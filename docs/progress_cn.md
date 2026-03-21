@@ -2,6 +2,16 @@
 
 ## 2026-03-21
 
+- 在 `pyproject.toml` 增加 `sft` 可选依赖组（`tinker`），并将环境安装更新为 `.[dev,sft]`。
+- 扩展 README/README_cn：补充 SFT 数据组织方式、JSONL 行级约束与训练数据示例。
+- 为每次推理的 LLM request/response 产物新增统一元数据字段：`inference_provider`、`inference_endpoint`、`inference_model`、`inference_parameters`。
+- 增加对应集成回归断言，确保推理元数据字段长期稳定。
+- 新增模块化 SFT 子系统 `src/opm_train/sft`，包含后端协议/注册表、JSONL 加载器与产物落盘 runner。
+- 新增内置 `tinker` SFT 后端：按需加载 SDK、循环 batch、加权 loss 统计与可选训练后采样。
+- CLI 新增 `opm-train sft` 子命令，支持 backend/base-model/input/优化器参数，并输出结构化 JSON。
+- 新增 SFT 产物目录 `.opm_train/sft_runs/<run_id>/`（`config.json`、`metrics.jsonl`、`result.json`）。
+- 更新默认 `provider.tinker` 运行配置为 Tinker OpenAI 兼容推理端点与 sampler 路径模型格式。
+- 增加对应回归测试：SFT 解析/后端执行/CLI 输出，以及 Tinker 默认 profile 配置接线。
 - 新增可扩展数据子系统 `src/opm_train/data`，提供通用契约（`DatasetSample`、`PreparedTask`、`ValidationResult`、`BatchItemResult`）与适配器注册表。
 - 将数学数据适配重构为共享 `MathVerifyDatasetAdapter`，并新增内置 `simple_math` 适配器。
 - `gsm8k` 加载阶段改为先提取规范化数值答案用于校验，同时保留原始答案文本。

@@ -19,7 +19,7 @@ You can verify the runtime end-to-end **without any external API key**:
 # 1) Setup
 conda env create -f environment.yml
 conda activate OpenCompany
-pip install -e ".[dev]"
+pip install -e ".[dev,sft]"
 
 # 2) Check environment/config
 opm-train doctor
@@ -33,6 +33,11 @@ For real model execution:
 ```bash
 export OPENROUTER_API_KEY="<your_key>"
 opm-train run "Inspect this repository and propose a refactor plan"
+
+export TINKER_API_KEY="<your_key>"
+opm-train run "Summarize this codebase" \
+  --provider-profile tinker \
+  --model "tinker://<train_id>/sampler_weights/<checkpoint_id>"
 ```
 
 ## Commands
@@ -45,6 +50,7 @@ opm-train doctor
 opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
+opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_model> [--steps 6] [--batch-size 8] [--learning-rate 1e-4]
 ```
 
 Common options:
@@ -54,6 +60,7 @@ Common options:
 - `--provider-profile`: `openrouter` | `tinker` | `custom`
 - `--model`: per-run model override
 - `--timer`: enable per-module timing output under `sessions/<session_id>/timers/`
+- `sft` supports `--prompt-key/--completion-key` for custom JSONL schemas.
 
 ## Architecture Overview
 
@@ -62,6 +69,7 @@ Common options:
 - `OrchestratorAgentLifecycleMixin`: agent think-act loop, finish semantics, and lineage cancellation.
 - `OrchestratorToolingMixin`: tool-run lifecycle and dispatch through a central tool registry.
 - `batch_runner`: dataset batch scheduler (parallel sample runs + artifact writing).
+- `sft/`: pluggable supervised fine-tuning runtime (backend ports + artifact persistence).
 - `data/`: pluggable dataset adapters for prompt construction and result validation.
 - `orchestrator_tools/registry.py`: canonical tool registry (`ToolSpec`) for unified add/remove/modify.
 - `AgentLoopRunner`: reusable think-act-feedback loop with step limits.
@@ -96,9 +104,73 @@ By default, runtime data is written under:
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl` (when `--timer` is enabled)
 - `.opm_train/batches/<batch_id>/results.jsonl` (per-sample evaluation records)
 - `.opm_train/batches/<batch_id>/summary.json` (aggregate metrics)
+- `.opm_train/sft_runs/<run_id>/config.json` (resolved run config + dataset mapping)
+- `.opm_train/sft_runs/<run_id>/metrics.jsonl` (per-step training metrics)
+- `.opm_train/sft_runs/<run_id>/result.json` (terminal backend summary)
+
+Each `llm_calls/*_request.json` and `*_response.json` includes canonical inference metadata:
+`inference_provider`, `inference_endpoint`, `inference_model`, and `inference_parameters` (for example `temperature`, `max_tokens`, tool-call switches).
 
 `events.jsonl` is the canonical raw trajectory log for analysis/training.
 Before `resume`, runtime performs strict snapshot/event-tail validation (contiguous `seq` and count match).
+
+## SFT Workflow
+
+`sft` currently ships with pluggable backend ports and one built-in backend: `tinker`.
+
+Install backend dependency:
+
+```bash
+conda run -n OpenCompany pip install tinker
+```
+
+Input is local JSONL. Supported key pairs per row:
+
+- `prompt` + `completion`
+- `input` + `output`
+- `instruction` + `output`
+- `question` + `answer`
+
+If your schema differs, pass `--prompt-key` and `--completion-key`.
+
+Recommended dataset layout:
+
+```text
+data/
+  sft/
+    train.jsonl
+    valid.jsonl        # optional
+    README.md          # optional dataset note/version
+```
+
+Row contract:
+
+- UTF-8 JSON object per physical line.
+- One prompt field + one completion field (from supported key pairs, or overridden keys).
+- Optional `id` field for stable traceability (`line-<n>` is used when absent).
+- Additional fields are preserved as metadata in normalized samples.
+
+Example:
+
+```jsonl
+{"id":"demo-0001","prompt":"Summarize the following diff...","completion":"Here is the summary...","source":"internal-v1"}
+{"id":"demo-0002","input":"Translate to Chinese: Hello","output":"你好","split":"train"}
+```
+
+Minimal run:
+
+```bash
+opm-train sft \
+  --backend tinker \
+  --input data/sft/train.jsonl \
+  --base-model Qwen/Qwen3-VL-30B-A3B-Instruct \
+  --output-model demo-sampler \
+  --steps 6 \
+  --batch-size 8 \
+  --learning-rate 1e-4
+```
+
+After training, use the checkpoint path in `result.json` (or `--model`) with `opm-train run --provider-profile tinker`.
 
 `batch-run` currently ships with built-in `gsm8k` and `simple_math` adapters for local JSONL inputs with fields:
 
@@ -192,6 +264,9 @@ class MyDatasetAdapter(DatasetAdapter):
 Edit `opm_train.toml`:
 
 - Provider profile routing (`openrouter`, `tinker`, `custom`) via one OpenAI-compatible client.
+- Default `provider.tinker.base_url` is set to Tinker OpenAI-compatible inference endpoint:
+  `https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1`.
+- `provider.tinker.model` should be a Tinker sampler path (`tinker://.../sampler_weights/...`), or override via `--model` in `run/resume/batch-run`.
 - Runtime limits (`max_children_per_agent`, `max_active_agents`, step budgets).
 - Protocol retry controls for invalid model payloads (`max_protocol_retries`, `protocol_retry_backoff_seconds`).
 - Runtime tools and context compression thresholds.

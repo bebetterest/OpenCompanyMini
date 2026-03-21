@@ -11,6 +11,7 @@
 - Multi-agent orchestration with explicit tool calls and parallel child execution.
 - Tooling layer is modularized by lifecycle and capability (session/agent/tools), and tools are dispatched via a central registry.
 - OpenAI-compatible provider abstraction with built-in `openrouter`, `tinker`, and `custom` profiles.
+- Supervised fine-tuning module with pluggable backend ports (built-in `tinker`) and JSONL-based run artifacts.
 - Context management with auto-threshold compression + manual `compress_context`.
 - JSONL canonical event logging and snapshot-based resume.
 - Strict snapshot-to-event-tail validation before resume (continuous sequence + tail consistency).

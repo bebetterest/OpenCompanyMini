@@ -104,6 +104,7 @@ class OrchestratorAgentLifecycleMixin:
 
             profile = self.config.provider.active_profile()
             model = self.model_override or profile.model
+            inference_metadata = self._inference_metadata(profile=profile, model=model)
             with self._timer_scope("prompt_primitives", agent=agent):
                 system_prompt = self.context_assembler.system_prompt(agent)
                 tools = self.context_assembler.tools(agent)
@@ -121,6 +122,8 @@ class OrchestratorAgentLifecycleMixin:
                     "agent_prompt",
                     {
                         "model": model,
+                        "inference_provider": inference_metadata["inference_provider"],
+                        "inference_parameters": inference_metadata["inference_parameters"],
                         "message_count": len(request_messages),
                         "tool_count": len(tools),
                         "protocol_attempt": attempt + 1,
@@ -133,9 +136,7 @@ class OrchestratorAgentLifecycleMixin:
                         "timestamp": utc_now(),
                         "protocol_attempt": attempt + 1,
                         "protocol_max_attempts": policy.max_attempts,
-                        "model": model,
-                        "temperature": profile.temperature,
-                        "max_tokens": profile.max_tokens,
+                        **inference_metadata,
                         "tool_count": len(tools),
                         "message_count": len(request_messages),
                         "messages": json_ready(request_messages),
@@ -168,6 +169,7 @@ class OrchestratorAgentLifecycleMixin:
                         sequence=llm_sequence,
                         payload={
                             "timestamp": utc_now(),
+                            **inference_metadata,
                             "ok": False,
                             "error_type": type(exc).__name__,
                             "error": str(exc),
@@ -197,7 +199,7 @@ class OrchestratorAgentLifecycleMixin:
                     "ok": True,
                     "protocol_attempt": attempt + 1,
                     "protocol_max_attempts": policy.max_attempts,
-                    "model": model,
+                    **inference_metadata,
                     "content": result.content,
                     "reasoning": result.reasoning,
                     "tool_calls": json_ready(result.tool_calls),
@@ -244,6 +246,27 @@ class OrchestratorAgentLifecycleMixin:
                         await asyncio.sleep(policy.backoff_seconds * (attempt + 1))
                     continue
             return self._invalid_model_response_actions(agent)
+
+    def _inference_metadata(self, *, profile: Any, model: str) -> dict[str, Any]:
+        """Build canonical inference metadata persisted in LLM request/response artifacts."""
+        provider_name = str(self.config.provider.profile or "openrouter").strip().lower() or "openrouter"
+        inference_parameters = {
+            "temperature": float(profile.temperature),
+            "max_tokens": int(profile.max_tokens),
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+        return {
+            "inference_provider": provider_name,
+            "inference_endpoint": str(profile.base_url),
+            "inference_model": str(model),
+            "inference_api_key_env": str(profile.api_key_env),
+            "inference_parameters": inference_parameters,
+            # Backward-compat mirror fields for old artifact readers.
+            "model": str(model),
+            "temperature": float(profile.temperature),
+            "max_tokens": int(profile.max_tokens),
+        }
 
     def _protocol_retry_policy(self) -> ProtocolRetryPolicy:
         """Resolve protocol retry policy from runtime limits."""

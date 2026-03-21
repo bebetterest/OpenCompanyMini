@@ -19,7 +19,7 @@
 # 1) 环境准备
 conda env create -f environment.yml
 conda activate OpenCompany
-pip install -e ".[dev]"
+pip install -e ".[dev,sft]"
 
 # 2) 检查配置与环境
 opm-train doctor
@@ -33,6 +33,11 @@ opm-train smoke --project-dir .
 ```bash
 export OPENROUTER_API_KEY="<your_key>"
 opm-train run "Inspect this repository and propose a refactor plan"
+
+export TINKER_API_KEY="<your_key>"
+opm-train run "Summarize this codebase" \
+  --provider-profile tinker \
+  --model "tinker://<train_id>/sampler_weights/<checkpoint_id>"
 ```
 
 ## 命令
@@ -45,6 +50,7 @@ opm-train doctor
 opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
+opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_model> [--steps 6] [--batch-size 8] [--learning-rate 1e-4]
 ```
 
 常用参数：
@@ -54,6 +60,7 @@ opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key 
 - `--provider-profile`：`openrouter` | `tinker` | `custom`
 - `--model`：本次运行模型覆盖
 - `--timer`：开启后将各模块计时写入 `sessions/<session_id>/timers/`
+- `sft` 支持 `--prompt-key/--completion-key` 以适配自定义 JSONL 字段。
 
 ## 架构概览
 
@@ -62,6 +69,7 @@ opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key 
 - `OrchestratorAgentLifecycleMixin`：代理 think-act 循环、finish 语义与谱系取消。
 - `OrchestratorToolingMixin`：工具运行生命周期与统一注册表分发。
 - `batch_runner`：数据集批量调度器（并行样本执行 + 产物落盘）。
+- `sft/`：可插拔监督微调运行时（后端端口 + 产物落盘）。
 - `data/`：可插拔数据适配层，负责 prompt 构造与结果校验。
 - `orchestrator_tools/registry.py`：规范工具注册表（`ToolSpec`），支持统一新增/删除/修改。
 - `AgentLoopRunner`：可复用 think-act-feedback 循环与步数限制。
@@ -96,9 +104,73 @@ opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key 
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl`（启用 `--timer` 时写入）
 - `.opm_train/batches/<batch_id>/results.jsonl`（逐样本评测记录）
 - `.opm_train/batches/<batch_id>/summary.json`（汇总指标）
+- `.opm_train/sft_runs/<run_id>/config.json`（解析后的运行配置与数据映射）
+- `.opm_train/sft_runs/<run_id>/metrics.jsonl`（逐 step 训练指标）
+- `.opm_train/sft_runs/<run_id>/result.json`（后端终态摘要）
+
+`llm_calls/*_request.json` 与 `*_response.json` 中会记录统一推理元数据：
+`inference_provider`、`inference_endpoint`、`inference_model`、`inference_parameters`（如 `temperature`、`max_tokens`、工具调用开关）。
 
 `events.jsonl` 是用于分析/训练的规范原始轨迹日志。
 在 `resume` 前，运行时会严格校验 snapshot 与 event-tail（`seq` 连续且数量一致）。
+
+## SFT 工作流
+
+`sft` 当前提供可扩展后端端口，内置后端为 `tinker`。
+
+安装后端依赖：
+
+```bash
+conda run -n OpenCompany pip install tinker
+```
+
+输入为本地 JSONL。每行支持以下字段对之一：
+
+- `prompt` + `completion`
+- `input` + `output`
+- `instruction` + `output`
+- `question` + `answer`
+
+若字段名不同，可通过 `--prompt-key` 与 `--completion-key` 指定。
+
+推荐数据组织：
+
+```text
+data/
+  sft/
+    train.jsonl
+    valid.jsonl        # 可选
+    README.md          # 可选，记录数据版本与说明
+```
+
+单行数据约束：
+
+- UTF-8 编码，每个物理行必须是一个 JSON 对象。
+- 必须有一组 prompt/completion 字段（支持默认字段对，或通过参数覆盖）。
+- 可选 `id` 字段用于稳定追踪（缺省时使用 `line-<n>`）。
+- 其他字段会保留到样本 metadata 中。
+
+示例：
+
+```jsonl
+{"id":"demo-0001","prompt":"Summarize the following diff...","completion":"Here is the summary...","source":"internal-v1"}
+{"id":"demo-0002","input":"Translate to Chinese: Hello","output":"你好","split":"train"}
+```
+
+最小示例：
+
+```bash
+opm-train sft \
+  --backend tinker \
+  --input data/sft/train.jsonl \
+  --base-model Qwen/Qwen3-VL-30B-A3B-Instruct \
+  --output-model demo-sampler \
+  --steps 6 \
+  --batch-size 8 \
+  --learning-rate 1e-4
+```
+
+训练后可将 `result.json` 里的 checkpoint 路径（或通过 `--model`）用于 `opm-train run --provider-profile tinker` 推理。
 
 `batch-run` 当前内置 `gsm8k` 与 `simple_math` 适配器，输入为本地 JSONL，字段要求：
 
@@ -192,6 +264,9 @@ class MyDatasetAdapter(DatasetAdapter):
 通过 `opm_train.toml` 配置：
 
 - Provider 选择（`openrouter`、`tinker`、`custom`）统一走 OpenAI 兼容客户端。
+- `provider.tinker.base_url` 默认已设为 Tinker OpenAI 兼容推理端点：
+  `https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1`。
+- `provider.tinker.model` 需使用 Tinker sampler 路径（`tinker://.../sampler_weights/...`），或在 `run/resume/batch-run` 用 `--model` 覆盖。
 - 运行限制（子代理数量、并发代理数、步数预算）。
 - 模型协议解析失败重试控制（`max_protocol_retries`、`protocol_retry_backoff_seconds`）。
 - 工具集合与上下文压缩阈值。

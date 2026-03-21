@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 
+PROVIDER_PROFILE_NAMES: tuple[str, ...] = ("openrouter", "tinker", "custom")
+
+
 _DEFAULT_RUNTIME_TOOL_NAMES = (
     "shell",
     "spawn_agent",
@@ -107,9 +110,9 @@ class ProviderConfig:
     )
     tinker: ProviderProfileConfig = field(
         default_factory=lambda: _provider_profile(
-            base_url="https://api.tinker.xyz/v1",
+            base_url="https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
             api_key_env="TINKER_API_KEY",
-            model="gpt-4o-mini",
+            model="tinker://replace-with-sampler-checkpoint",
         )
     )
     custom: ProviderProfileConfig = field(
@@ -123,11 +126,12 @@ class ProviderConfig:
     def active_profile(self) -> ProviderProfileConfig:
         """Return currently selected profile, defaulting to openrouter."""
         selected = str(self.profile or "openrouter").strip().lower()
-        return {
+        profiles = {
             "openrouter": self.openrouter,
             "tinker": self.tinker,
             "custom": self.custom,
-        }.get(selected, self.openrouter)
+        }
+        return profiles.get(selected, self.openrouter)
 
 
 @dataclass(slots=True)
@@ -239,7 +243,7 @@ class OPMTrainConfig:
         if not payload:
             return
         self.provider.profile = str(payload.get("profile", self.provider.profile)).strip() or self.provider.profile
-        for profile_name in ("openrouter", "tinker", "custom"):
+        for profile_name in PROVIDER_PROFILE_NAMES:
             profile_payload = _as_dict(payload.get(profile_name))
             if not profile_payload:
                 continue

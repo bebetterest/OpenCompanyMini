@@ -47,3 +47,10 @@ def test_load_runtime_limits_protocol_retry_fields() -> None:
         config = OPMTrainConfig.load(app_dir)
         assert config.runtime.limits.max_protocol_retries == 4
         assert config.runtime.limits.protocol_retry_backoff_seconds == 0.6
+
+
+def test_default_tinker_profile_matches_openai_compatible_inference_endpoint() -> None:
+    config = OPMTrainConfig()
+    profile = config.provider.tinker
+    assert profile.base_url == "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
+    assert profile.model.startswith("tinker://")

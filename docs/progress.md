@@ -2,6 +2,16 @@
 
 ## 2026-03-21
 
+- Added `sft` dependency extra in `pyproject.toml` (`tinker`) and updated environment bootstrap to install `.[dev,sft]`.
+- Extended README/README_cn with concrete SFT dataset organization, JSONL row contract, and training data examples.
+- Added canonical inference metadata in per-agent LLM artifacts (`inference_provider`, `inference_endpoint`, `inference_model`, `inference_parameters`) for request/response records.
+- Added regression assertions to keep inference metadata fields stable in integration artifacts.
+- Added modular SFT subsystem under `src/opm_train/sft` with backend protocol/registry, JSONL loader, and artifact runner.
+- Added built-in `tinker` SFT backend with lazy SDK import, cyclic batching, weighted-loss tracking, and optional post-train sample generation.
+- Added CLI subcommand `opm-train sft` with backend/base-model/input/optimizer controls and structured JSON output.
+- Added SFT artifacts under `.opm_train/sft_runs/<run_id>/` (`config.json`, `metrics.jsonl`, `result.json`).
+- Updated default `provider.tinker` runtime profile to Tinker OpenAI-compatible inference endpoint and sampler-path model shape.
+- Added regression tests for SFT parsing/backend execution/CLI output and Tinker default profile wiring.
 - Added extensible dataset subsystem under `src/opm_train/data` with reusable contracts (`DatasetSample`, `PreparedTask`, `ValidationResult`, `BatchItemResult`) and adapter registry.
 - Refactored math datasets onto shared `MathVerifyDatasetAdapter` and added built-in `simple_math` adapter.
 - Updated `gsm8k` loading to extract canonical numeric references at ingest time while preserving raw answer text separately.

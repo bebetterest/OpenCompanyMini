@@ -770,6 +770,15 @@ async def test_agent_artifacts_persist_llm_calls_and_context_compressions() -> N
         ]
         assert "请用中文总结当前任务" in (llm_dir / "0001_request.json").read_text(encoding="utf-8")
         assert "中文总结完成" in (llm_dir / "0002_response.json").read_text(encoding="utf-8")
+        first_request = json.loads((llm_dir / "0001_request.json").read_text(encoding="utf-8"))
+        first_response = json.loads((llm_dir / "0001_response.json").read_text(encoding="utf-8"))
+        expected_model = orchestrator.config.provider.active_profile().model
+        assert first_request["inference_provider"] == "openrouter"
+        assert first_request["inference_model"] == expected_model
+        assert first_request["inference_parameters"]["tool_choice"] == "auto"
+        assert first_request["inference_parameters"]["parallel_tool_calls"] is True
+        assert first_response["inference_provider"] == "openrouter"
+        assert first_response["inference_model"] == expected_model
 
         context_files = sorted(path.name for path in context_dir.glob("*.json"))
         assert context_files == ["0001.json"]

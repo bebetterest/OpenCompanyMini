@@ -17,9 +17,9 @@ max_tokens = 4096
 headers = { "HTTP-Referer" = "https://github.com/opencompany/opm-train", "X-Title" = "opm-train" }
 
 [provider.tinker]
-base_url = "https://api.tinker.xyz/v1"
+base_url = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 api_key_env = "TINKER_API_KEY"
-model = "gpt-4o-mini"
+model = "tinker://replace-with-sampler-checkpoint"
 timeout_seconds = 120
 max_retries = 2
 retry_backoff_seconds = 1.0

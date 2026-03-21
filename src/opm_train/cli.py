@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from opm_train.batch_runner import BatchRunConfig, OrchestratorFactory, run_batch
+from opm_train.config import PROVIDER_PROFILE_NAMES
 from opm_train.data import list_dataset_adapters
 from opm_train.diagnostics import build_doctor_payload
 from opm_train.llm import ChatResult
 from opm_train.orchestrator import RuntimeOrchestrator, default_app_dir
-
-_PROVIDER_CHOICES = ["openrouter", "tinker", "custom"]
+from opm_train.sft import SFTRunConfig, list_sft_backends, run_sft
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +67,24 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--resume", action="store_true", help="Resume from existing batch directory")
     batch_parser.add_argument("--smoke", action="store_true", help="Run batch with local smoke LLM (no API key)")
     batch_parser.add_argument("--model", default=None, help="Override model for this batch run")
+
+    sft_parser = subparsers.add_parser("sft", help="Run supervised fine-tuning with pluggable backend")
+    _add_common_path_args(sft_parser)
+    sft_parser.add_argument("--backend", default="tinker", choices=list_sft_backends(), help="SFT backend name")
+    sft_parser.add_argument("--input", required=True, help="Path to local SFT JSONL input")
+    sft_parser.add_argument("--base-model", required=True, help="Base model id/path for selected SFT backend")
+    sft_parser.add_argument("--output-model", default=None, help="Optional output model name")
+    sft_parser.add_argument("--steps", type=int, default=6, help="Training steps (default: 6)")
+    sft_parser.add_argument("--batch-size", type=int, default=8, help="Training batch size (default: 8)")
+    sft_parser.add_argument("--learning-rate", type=float, default=1e-4, help="Optimizer learning rate (default: 1e-4)")
+    sft_parser.add_argument("--rank", type=int, default=32, help="LoRA rank for backends that support it (default: 32)")
+    sft_parser.add_argument("--limit", type=int, default=None, help="Optional max training sample count")
+    sft_parser.add_argument("--prompt-key", default=None, help="Override prompt field key in JSONL")
+    sft_parser.add_argument("--completion-key", default=None, help="Override completion field key in JSONL")
+    sft_parser.add_argument("--sample-prompt", default=None, help="Optional prompt to sample after training")
+    sft_parser.add_argument("--sample-max-tokens", type=int, default=64, help="Max tokens for optional post-train sample")
+    sft_parser.add_argument("--sample-temperature", type=float, default=0.0, help="Temperature for optional post-train sample")
+    sft_parser.add_argument("--run-id", default=None, help="Optional stable SFT run id")
 
     return parser
 
@@ -132,7 +150,7 @@ def _add_provider_profile_arg(parser: argparse.ArgumentParser, *, help_text: str
     parser.add_argument(
         "--provider-profile",
         default=None,
-        choices=_PROVIDER_CHOICES,
+        choices=list(PROVIDER_PROFILE_NAMES),
         help=help_text,
     )
 
@@ -191,13 +209,56 @@ async def _run_async(args: argparse.Namespace) -> int:
     """Dispatch CLI command and print compact JSON result payloads."""
     app_dir = Path(args.app_dir).resolve() if args.app_dir else default_app_dir()
     project_dir = Path(args.project_dir).resolve()
+    if args.command == "sft":
+        sft_output = run_sft(
+            SFTRunConfig(
+                backend=str(args.backend),
+                input_path=Path(str(args.input)),
+                project_dir=project_dir,
+                app_dir=app_dir,
+                base_model=str(args.base_model),
+                output_model=getattr(args, "output_model", None),
+                steps=int(getattr(args, "steps", 6)),
+                batch_size=int(getattr(args, "batch_size", 8)),
+                learning_rate=float(getattr(args, "learning_rate", 1e-4)),
+                rank=int(getattr(args, "rank", 32)),
+                limit=getattr(args, "limit", None),
+                prompt_key=getattr(args, "prompt_key", None),
+                completion_key=getattr(args, "completion_key", None),
+                sample_prompt=getattr(args, "sample_prompt", None),
+                sample_max_tokens=int(getattr(args, "sample_max_tokens", 64)),
+                sample_temperature=float(getattr(args, "sample_temperature", 0.0)),
+                run_id=getattr(args, "run_id", None),
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "run_id": sft_output.run_id,
+                    "backend": sft_output.result.backend,
+                    "base_model": sft_output.result.base_model,
+                    "output_model": sft_output.result.output_model,
+                    "total_examples": sft_output.total_examples,
+                    "steps": len(sft_output.result.losses),
+                    "losses": sft_output.result.losses,
+                    "checkpoint_path": sft_output.result.checkpoint_path,
+                    "sample_output": sft_output.result.sample_output,
+                    "artifact_dir": str(sft_output.artifact_dir),
+                    "result_path": str(sft_output.result_path),
+                    "metrics_path": str(sft_output.metrics_path),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
     if args.command == "batch-run":
         batch_orchestrator_factory = _build_batch_orchestrator_factory(
             args=args,
             app_dir=app_dir,
             project_dir=project_dir,
         )
-        output = await run_batch(
+        batch_output = await run_batch(
             BatchRunConfig(
                 dataset=str(args.dataset),
                 input_path=Path(str(args.input)),
@@ -217,14 +278,14 @@ async def _run_async(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "batch_id": output.batch_id,
-                    "total": output.summary.total,
-                    "validated": output.summary.validated,
-                    "correct": output.summary.correct,
-                    "accuracy": output.summary.accuracy,
-                    "failed_sessions": output.summary.failed_sessions,
-                    "results_path": str(output.results_path),
-                    "summary_path": str(output.summary_path),
+                    "batch_id": batch_output.batch_id,
+                    "total": batch_output.summary.total,
+                    "validated": batch_output.summary.validated,
+                    "correct": batch_output.summary.correct,
+                    "accuracy": batch_output.summary.accuracy,
+                    "failed_sessions": batch_output.summary.failed_sessions,
+                    "results_path": str(batch_output.results_path),
+                    "summary_path": str(batch_output.summary_path),
                 },
                 ensure_ascii=False,
             )

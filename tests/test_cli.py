@@ -10,8 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 import opm_train.batch_runner as batch_runner_module
+import opm_train.cli as cli_module
 from opm_train.cli import main
 from opm_train.models import RunSession, SessionStatus
+from opm_train.sft.contracts import SFTBackendResult
+from opm_train.sft.runner import SFTRunOutput
 
 APP_DIR = Path(__file__).resolve().parents[1]
 
@@ -476,3 +479,60 @@ def test_batch_run_command_supports_mixed_dataset_mode(capsys, monkeypatch) -> N
         assert rc == 0
         payload = json.loads(capsys.readouterr().out.strip())
         assert payload["total"] == 2
+
+
+def test_sft_command_outputs_structured_payload(capsys, monkeypatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        input_path = app_dir / "sft.jsonl"
+        input_path.write_text('{"id":"x1","prompt":"hello","completion":"world"}\n', encoding="utf-8")
+        artifact_dir = app_dir / ".opm_train" / "sft_runs" / "sft-cli-run"
+        artifact_dir.mkdir(parents=True)
+        result_path = artifact_dir / "result.json"
+        metrics_path = artifact_dir / "metrics.jsonl"
+        result_path.write_text("{}", encoding="utf-8")
+        metrics_path.write_text("", encoding="utf-8")
+
+        def _fake_run_sft(config):
+            assert config.backend == "tinker"
+            assert config.base_model == "Qwen/Qwen3"
+            return SFTRunOutput(
+                run_id="sft-cli-run",
+                artifact_dir=artifact_dir,
+                result_path=result_path,
+                metrics_path=metrics_path,
+                total_examples=1,
+                result=SFTBackendResult(
+                    backend="tinker",
+                    base_model="Qwen/Qwen3",
+                    output_model="demo-model",
+                    losses=[0.7, 0.3],
+                    checkpoint_path="tinker://demo/checkpoint",
+                    sample_output="ok",
+                ),
+            )
+
+        monkeypatch.setattr(cli_module, "run_sft", _fake_run_sft)
+
+        rc = main(
+            [
+                "sft",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(app_dir),
+                "--backend",
+                "tinker",
+                "--input",
+                str(input_path),
+                "--base-model",
+                "Qwen/Qwen3",
+            ]
+        )
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["run_id"] == "sft-cli-run"
+        assert payload["backend"] == "tinker"
+        assert payload["total_examples"] == 1
+        assert payload["steps"] == 2
+        assert payload["checkpoint_path"] == "tinker://demo/checkpoint"
