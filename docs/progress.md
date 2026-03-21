@@ -2,6 +2,17 @@
 
 ## 2026-03-21
 
+- Added extensible dataset subsystem under `src/opm_train/data` with reusable contracts (`DatasetSample`, `PreparedTask`, `ValidationResult`, `BatchItemResult`) and adapter registry.
+- Refactored math datasets onto shared `MathVerifyDatasetAdapter` and added built-in `simple_math` adapter.
+- Updated `gsm8k` loading to extract canonical numeric references at ingest time while preserving raw answer text separately.
+- Fixed JSONL parsing to stream physical lines (instead of `splitlines()`), avoiding failures on valid Hugging Face rows that contain Unicode separators (for example `U+2028`) inside fields.
+- Added dataset batch runner `opm_train.batch_runner` with configurable concurrency, per-sample fault tolerance, realtime JSONL append, and aggregate summary output.
+- Added CLI subcommand `opm-train batch-run` with `--dataset/--input/--concurrency/--limit/--batch-id/--resume` and structured JSON output for batch metrics + artifact paths.
+- Added batch resume support via `--batch-id` + `--resume`, skipping already completed `sample_id`s from existing `results.jsonl`.
+- Added mixed-dataset routing (`--dataset mixed` + per-row adapter key) to dispatch each row to the corresponding adapter.
+- Added `--smoke` support for `batch-run` to validate end-to-end batch flow without external API keys.
+- Removed static `contract_samples` fixtures to avoid hard-coded payload drift; contract validation stays runtime-driven (`doctor` + tool schema checks).
+- Added tests for GSM8K/simple-math parsing/validation, dataset registry extensibility, mixed routing, realtime writes/resume behavior, and batch-run CLI integration with local runtime stubs.
 - Added finish-guard semantics for active own tool runs: `finish` now returns structured rejection payload (`finish_rejected`, `unfinished_tool_runs`) instead of failing the agent loop.
 - Added `ToolRunStatus.abandoned` and changed resume behavior to mark non-restorable non-terminal tool runs as `abandoned` with explicit reason.
 - Enhanced `doctor` output with tool-contract validation (`tool_contract_ok`, `tool_contract_issues`) and gated `ready_for_real_run` on contract consistency.

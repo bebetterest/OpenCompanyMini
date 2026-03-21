@@ -42,6 +42,9 @@ opm-train run <task>
 opm-train resume <session_id> <instruction>
 opm-train smoke [--task <task>]
 opm-train doctor
+opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
+opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
+opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
 ```
 
 常用参数：
@@ -58,6 +61,8 @@ opm-train doctor
 - `OrchestratorSessionLifecycleMixin`：会话启动/恢复与 root 生命周期收敛。
 - `OrchestratorAgentLifecycleMixin`：代理 think-act 循环、finish 语义与谱系取消。
 - `OrchestratorToolingMixin`：工具运行生命周期与统一注册表分发。
+- `batch_runner`：数据集批量调度器（并行样本执行 + 产物落盘）。
+- `data/`：可插拔数据适配层，负责 prompt 构造与结果校验。
 - `orchestrator_tools/registry.py`：规范工具注册表（`ToolSpec`），支持统一新增/删除/修改。
 - `AgentLoopRunner`：可复用 think-act-feedback 循环与步数限制。
 - `LoopHooks`：独立扩展点，可自定义循环行为。
@@ -89,9 +94,98 @@ opm-train doctor
 - `.opm_train/sessions/<session_id>/logs/runtime.log`
 - `.opm_train/sessions/<session_id>/logs/errors.jsonl`
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl`（启用 `--timer` 时写入）
+- `.opm_train/batches/<batch_id>/results.jsonl`（逐样本评测记录）
+- `.opm_train/batches/<batch_id>/summary.json`（汇总指标）
 
 `events.jsonl` 是用于分析/训练的规范原始轨迹日志。
 在 `resume` 前，运行时会严格校验 snapshot 与 event-tail（`seq` 连续且数量一致）。
+
+`batch-run` 当前内置 `gsm8k` 与 `simple_math` 适配器，输入为本地 JSONL，字段要求：
+
+- `question`（字符串，必填）
+- `answer`（字符串，必填）
+- `id`（字符串，可选）
+
+数学类适配器在加载时会把 `answer` 归一化为：
+
+- `reference_answer`：用于校验的规范化数值答案。
+- `reference_answer_raw`：保留原始答案文本，便于审计/排查。
+
+可使用 Hugging Face 官方数据（`openai/gsm8k:main`）生成本地 `train/test` JSONL（需先安装 `datasets`：`conda run -n OpenCompany pip install datasets`）：
+
+```bash
+conda run -n OpenCompany python - <<'PY'
+import json
+from pathlib import Path
+from datasets import load_dataset
+
+out_dir = Path("data/gsm8k")
+out_dir.mkdir(parents=True, exist_ok=True)
+dataset = load_dataset("openai/gsm8k", "main")
+for split in ("train", "test"):
+    out_path = out_dir / f"{split}.jsonl"
+    with out_path.open("w", encoding="utf-8") as handle:
+        for index, row in enumerate(dataset[split], start=1):
+            payload = {
+                "id": f"gsm8k-{split}-{index:06d}",
+                "question": row["question"],
+                "answer": row["answer"],
+            }
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    print(split, len(dataset[split]), out_path)
+PY
+```
+
+说明：JSONL 读取器按“物理行”流式读取（不使用 `splitlines()`），可正确处理题干中出现的 Unicode 分隔符（如 `U+2028`）。
+
+`gsm8k` 与 `simple_math` 校验均使用 [Math-Verify](https://github.com/huggingface/Math-Verify)，并期望运行时总结包含 `FINAL_ANSWER: <number>`。
+
+`mixed` 混合数据模式：
+
+- 每行 JSONL 需包含适配器选择键（默认 `adapter`）。
+- 示例：`{"adapter":"gsm8k","id":"m1","question":"...","answer":"#### 42"}`。
+- 示例：`{"adapter":"simple_math","id":"m2","question":"13*7","answer":"91"}`。
+- 运行时会按行路由到对应适配器，并在 `results.jsonl` 写入 `adapter_name`。
+
+## 数据集扩展流程
+
+1. 新增适配器
+   在 `src/opm_train/data/<dataset>.py` 继承并实现 `DatasetAdapter`（`sample_from_payload`、`load_samples`、`build_task_prompt`、`validate_result`）。
+2. 注册适配器
+   在 `src/opm_train/data/__init__.py` 通过 `register_dataset_adapter(...)` 注册。
+3. 批量运行
+   执行 `opm-train batch-run --dataset <dataset_name> --input <jsonl>`。
+4. 补充测试
+   增加适配器解析/校验测试，以及一条 batch CLI 集成测试。
+
+最小适配器形态：
+
+```python
+from opm_train.data.contracts import DatasetAdapter, DatasetSample, PreparedTask, ValidationResult
+from opm_train.models import RunSession
+
+class MyDatasetAdapter(DatasetAdapter):
+    name = "my_dataset"
+
+    def sample_from_payload(self, payload: dict, *, line_no: int) -> DatasetSample: ...
+    def load_samples(self, *, input_path, limit=None) -> list[DatasetSample]: ...
+    def build_task_prompt(self, sample: DatasetSample) -> PreparedTask: ...
+    def validate_result(self, *, sample: DatasetSample, session: RunSession) -> ValidationResult: ...
+```
+
+`batch-run` 行为：
+
+- 并发执行样本（`--concurrency` 可配置）。
+- 实时写入 JSONL（每个样本完成即追加到 `results.jsonl`）。
+- 支持断点续跑（`--batch-id <id> --resume`），按 `(adapter_name, sample_id)` 跳过已完成样本并继续未完成部分。
+- 支持 `--smoke` 模式，无需外部 LLM API Key 即可跑通批量链路。
+
+`results.jsonl` 单行字段包括：
+
+- `adapter_name`、`sample_id`、`task_prompt`、`reference_answer`
+- `reference_answer_raw`
+- `predicted_answer`、`is_correct`
+- `session_id`、`session_status`、`final_summary`、`error`
 
 ## 配置
 

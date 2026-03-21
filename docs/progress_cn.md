@@ -2,6 +2,17 @@
 
 ## 2026-03-21
 
+- 新增可扩展数据子系统 `src/opm_train/data`，提供通用契约（`DatasetSample`、`PreparedTask`、`ValidationResult`、`BatchItemResult`）与适配器注册表。
+- 将数学数据适配重构为共享 `MathVerifyDatasetAdapter`，并新增内置 `simple_math` 适配器。
+- `gsm8k` 加载阶段改为先提取规范化数值答案用于校验，同时保留原始答案文本。
+- 修复 JSONL 解析：改为按物理行流式读取（不再使用 `splitlines()`），避免 Hugging Face 合法样本字段内含 Unicode 分隔符（如 `U+2028`）时误判为坏行。
+- 新增批量执行器 `opm_train.batch_runner`，支持并发可配置、单样本容错、实时 JSONL 追加写入与汇总 JSON 输出。
+- CLI 新增 `opm-train batch-run` 子命令，支持 `--dataset/--input/--concurrency/--limit/--batch-id/--resume`，输出结构化批量指标与产物路径。
+- 新增 `--batch-id` + `--resume` 续跑能力，基于 `results.jsonl` 中已完成 `sample_id` 跳过并继续未完成样本。
+- 新增混合数据路由能力（`--dataset mixed` + 每行适配器键），按行分派到对应 adapter 执行。
+- 新增 `batch-run --smoke`，无需外部 API Key 可验证端到端批量链路。
+- 删除静态 `contract_samples` 样例，避免写死 payload 与运行时契约漂移；契约校验仍由 `doctor` 与工具 schema 驱动。
+- 增加对应测试：GSM8K/simple-math 解析与校验、数据注册扩展能力、混合路由、实时写入/续跑行为、batch-run CLI 集成路径（本地 stub 运行时）。
 - 增加 active own tool run 的 finish 保护语义：`finish` 不再直接打失败，而是返回结构化拒绝结果（`finish_rejected`、`unfinished_tool_runs`）。
 - 增加 `ToolRunStatus.abandoned`，并将 resume 对不可恢复未终态 tool run 的处理改为 `abandoned`（附明确 reason）。
 - 增强 `doctor` 输出：新增工具契约校验字段（`tool_contract_ok`、`tool_contract_issues`），并将其纳入 `ready_for_real_run` 判定。

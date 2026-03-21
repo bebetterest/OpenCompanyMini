@@ -1,0 +1,5 @@
+{
+  "source": "openai/gsm8k:main",
+  "train_rows": 7473,
+  "test_rows": 1319
+}
