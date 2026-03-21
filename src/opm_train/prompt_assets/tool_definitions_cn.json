@@ -1,0 +1,202 @@
+{
+  "shell": {
+    "type": "function",
+    "function": {
+      "name": "shell",
+      "description": "在项目工作区中运行 shell 命令。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "要执行的命令。"},
+          "cwd": {"type": "string", "description": "工作区相对目录。", "default": "."},
+          "timeout_seconds": {"type": "number", "description": "超时秒数。", "minimum": 1, "maximum": 600},
+          "blocking": {"type": "boolean", "description": "是否等待执行完成。", "default": true}
+        },
+        "required": ["command"]
+      }
+    }
+  },
+  "spawn_agent": {
+    "type": "function",
+    "function": {
+      "name": "spawn_agent",
+      "description": "创建 worker 子代理执行任务。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "description": "子代理名称。"},
+          "instruction": {"type": "string", "description": "子代理指令。"},
+          "blocking": {"type": "boolean", "description": "是否阻塞等待子代理完成。", "default": false}
+        },
+        "required": ["instruction"]
+      }
+    }
+  },
+  "steer_agent": {
+    "type": "function",
+    "function": {
+      "name": "steer_agent",
+      "description": "向指定代理发送转向消息。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "目标代理 ID。"},
+          "content": {"type": "string", "description": "消息内容。"}
+        },
+        "required": ["agent_id", "content"]
+      }
+    }
+  },
+  "cancel_agent": {
+    "type": "function",
+    "function": {
+      "name": "cancel_agent",
+      "description": "取消一个代理（含其子代理）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "要取消的代理 ID。"}
+        },
+        "required": ["agent_id"]
+      }
+    }
+  },
+  "list_agent_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_agent_runs",
+      "description": "列出当前会话中的代理运行记录。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "description": "可选状态过滤。"},
+          "limit": {"type": "integer", "description": "分页大小。"},
+          "cursor": {"type": "string", "description": "上一页返回的游标。"}
+        }
+      }
+    }
+  },
+  "get_agent_run": {
+    "type": "function",
+    "function": {
+      "name": "get_agent_run",
+      "description": "读取单个代理运行详情。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "代理 ID。"}
+        },
+        "required": ["agent_id"]
+      }
+    }
+  },
+  "list_tool_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_tool_runs",
+      "description": "列出当前会话中的工具运行记录。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "description": "可选状态过滤。"},
+          "limit": {"type": "integer", "description": "分页大小。"},
+          "cursor": {"type": "string", "description": "上一页返回的游标。"}
+        }
+      }
+    }
+  },
+  "get_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "get_tool_run",
+      "description": "读取单个工具运行详情。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string", "description": "工具运行 ID。"}
+        },
+        "required": ["run_id"]
+      }
+    }
+  },
+  "wait_run": {
+    "type": "function",
+    "function": {
+      "name": "wait_run",
+      "description": "等待某个工具运行结束。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string", "description": "工具运行 ID。"},
+          "timeout_seconds": {"type": "number", "description": "可选超时秒数。"}
+        },
+        "required": ["run_id"]
+      }
+    }
+  },
+  "cancel_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "cancel_tool_run",
+      "description": "取消一个运行中的工具任务。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string", "description": "工具运行 ID。"}
+        },
+        "required": ["run_id"]
+      }
+    }
+  },
+  "wait_time": {
+    "type": "function",
+    "function": {
+      "name": "wait_time",
+      "description": "短时间等待。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "seconds": {"type": "number", "description": "等待秒数。", "minimum": 0, "maximum": 120}
+        },
+        "required": ["seconds"]
+      }
+    }
+  },
+  "compress_context": {
+    "type": "function",
+    "function": {
+      "name": "compress_context",
+      "description": "将较早上下文压缩为摘要。",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  "finish": {
+    "type": "function",
+    "function": {
+      "name": "finish",
+      "description": "结束当前代理循环并输出摘要。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "完成状态",
+            "enum": ["completed", "partial", "failed"]
+          },
+          "summary": {
+            "type": "string",
+            "description": "对已完成工作与结果的简明总结。"
+          },
+          "next_recommendation": {
+            "type": "string",
+            "description": "worker 在 partial/failed 时需要给出下一步建议。"
+          }
+        },
+        "required": ["status", "summary"]
+      }
+    }
+  }
+}

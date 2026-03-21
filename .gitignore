@@ -1,0 +1,52 @@
+# Reference implementation (explicitly kept out of this repo's scope)
+OpenCompany/
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.pyre/
+.tox/
+.nox/
+
+# Coverage/test artifacts
+.coverage
+.coverage.*
+htmlcov/
+
+# Build/packaging artifacts
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# Virtual envs / local Python version
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Runtime data
+.opm_train/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editor/OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

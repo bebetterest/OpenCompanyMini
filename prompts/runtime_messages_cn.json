@@ -1,0 +1,7 @@
+{
+  "root_initial_message": "用户任务：{task}\\n项目目录：{project_dir}\\n请通过工具进行规划与执行。",
+  "worker_initial_message": "分配指令：{instruction}\\n工作区路径：{workspace_path}\\n父代理 ID：{parent_agent_id}",
+  "resume_instruction_message": "恢复指令：{instruction}",
+  "steer_message": "来自其他代理的转向消息：{content}",
+  "context_latest_summary": "较早对话已压缩如下（v{summary_version}）：\\n{summary}"
+}

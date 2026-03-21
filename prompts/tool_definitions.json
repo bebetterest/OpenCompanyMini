@@ -1,0 +1,202 @@
+{
+  "shell": {
+    "type": "function",
+    "function": {
+      "name": "shell",
+      "description": "Run a shell command inside the project workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "Shell command to execute."},
+          "cwd": {"type": "string", "description": "Workspace-relative directory.", "default": "."},
+          "timeout_seconds": {"type": "number", "description": "Command timeout in seconds.", "minimum": 1, "maximum": 600},
+          "blocking": {"type": "boolean", "description": "Wait for completion before returning.", "default": true}
+        },
+        "required": ["command"]
+      }
+    }
+  },
+  "spawn_agent": {
+    "type": "function",
+    "function": {
+      "name": "spawn_agent",
+      "description": "Create a worker agent to execute scoped work.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "description": "Display name for the child agent."},
+          "instruction": {"type": "string", "description": "Concrete instruction for the child agent."},
+          "blocking": {"type": "boolean", "description": "Wait for child completion before returning.", "default": false}
+        },
+        "required": ["instruction"]
+      }
+    }
+  },
+  "steer_agent": {
+    "type": "function",
+    "function": {
+      "name": "steer_agent",
+      "description": "Send a steer message to an existing agent.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "Target agent id."},
+          "content": {"type": "string", "description": "Steer message content."}
+        },
+        "required": ["agent_id", "content"]
+      }
+    }
+  },
+  "cancel_agent": {
+    "type": "function",
+    "function": {
+      "name": "cancel_agent",
+      "description": "Cancel one agent (and descendants).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "Agent id to cancel."}
+        },
+        "required": ["agent_id"]
+      }
+    }
+  },
+  "list_agent_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_agent_runs",
+      "description": "List agent runs in this session.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "description": "Optional status filter."},
+          "limit": {"type": "integer", "description": "Page size."},
+          "cursor": {"type": "string", "description": "Pagination cursor from previous call."}
+        }
+      }
+    }
+  },
+  "get_agent_run": {
+    "type": "function",
+    "function": {
+      "name": "get_agent_run",
+      "description": "Get one agent run detail.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {"type": "string", "description": "Agent id."}
+        },
+        "required": ["agent_id"]
+      }
+    }
+  },
+  "list_tool_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_tool_runs",
+      "description": "List tool runs in this session.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "description": "Optional status filter."},
+          "limit": {"type": "integer", "description": "Page size."},
+          "cursor": {"type": "string", "description": "Pagination cursor from previous call."}
+        }
+      }
+    }
+  },
+  "get_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "get_tool_run",
+      "description": "Get one tool run detail.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string", "description": "Tool run id."}
+        },
+        "required": ["run_id"]
+      }
+    }
+  },
+  "wait_run": {
+    "type": "function",
+    "function": {
+      "name": "wait_run",
+      "description": "Wait for a tool run to finish.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string", "description": "Tool run id."},
+          "timeout_seconds": {"type": "number", "description": "Optional wait timeout."}
+        },
+        "required": ["run_id"]
+      }
+    }
+  },
+  "cancel_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "cancel_tool_run",
+      "description": "Cancel a running tool run.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {"type": "string", "description": "Tool run id."}
+        },
+        "required": ["run_id"]
+      }
+    }
+  },
+  "wait_time": {
+    "type": "function",
+    "function": {
+      "name": "wait_time",
+      "description": "Sleep for a short duration.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "seconds": {"type": "number", "description": "Seconds to sleep.", "minimum": 0, "maximum": 120}
+        },
+        "required": ["seconds"]
+      }
+    }
+  },
+  "compress_context": {
+    "type": "function",
+    "function": {
+      "name": "compress_context",
+      "description": "Compress older context into a summary.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  "finish": {
+    "type": "function",
+    "function": {
+      "name": "finish",
+      "description": "Finish the current agent loop with summary output.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "completion status",
+            "enum": ["completed", "partial", "failed"]
+          },
+          "summary": {
+            "type": "string",
+            "description": "Concise summary of completed work and key outcomes."
+          },
+          "next_recommendation": {
+            "type": "string",
+            "description": "Required for worker when status is partial or failed."
+          }
+        },
+        "required": ["status", "summary"]
+      }
+    }
+  }
+}

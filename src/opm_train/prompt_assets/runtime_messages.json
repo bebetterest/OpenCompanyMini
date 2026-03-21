@@ -1,0 +1,7 @@
+{
+  "root_initial_message": "User task: {task}\nProject directory: {project_dir}\nPlan and execute via tools.",
+  "worker_initial_message": "Assigned instruction: {instruction}\nWorkspace path: {workspace_path}\nParent agent id: {parent_agent_id}",
+  "resume_instruction_message": "Resume instruction: {instruction}",
+  "steer_message": "Steer message from another agent: {content}",
+  "context_latest_summary": "Earlier conversation was compressed as follows (v{summary_version}):\\n{summary}"
+}

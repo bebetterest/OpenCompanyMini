@@ -1,0 +1,91 @@
+[project]
+name = "opm-train"
+data_dir = ".opm_train"
+
+[provider]
+profile = "openrouter"
+
+[provider.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-4o-mini"
+timeout_seconds = 120
+max_retries = 3
+retry_backoff_seconds = 1.0
+temperature = 0.2
+max_tokens = 4096
+headers = { "HTTP-Referer" = "https://github.com/opencompany/opm-train", "X-Title" = "opm-train" }
+
+[provider.tinker]
+base_url = "https://api.tinker.xyz/v1"
+api_key_env = "TINKER_API_KEY"
+model = "gpt-4o-mini"
+timeout_seconds = 120
+max_retries = 2
+retry_backoff_seconds = 1.0
+temperature = 0.2
+max_tokens = 4096
+
+[provider.custom]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o-mini"
+timeout_seconds = 120
+max_retries = 2
+retry_backoff_seconds = 1.0
+temperature = 0.2
+max_tokens = 4096
+
+[runtime.limits]
+max_children_per_agent = 6
+max_active_agents = 8
+max_root_steps = 64
+max_agent_steps = 48
+max_protocol_retries = 2
+protocol_retry_backoff_seconds = 0.25
+
+[runtime.context]
+enabled = true
+auto_compress_ratio = 0.8
+keep_pinned_messages = 1
+max_context_tokens = 96000
+
+[runtime.tools]
+root_tools = [
+  "shell",
+  "spawn_agent",
+  "steer_agent",
+  "cancel_agent",
+  "list_agent_runs",
+  "get_agent_run",
+  "list_tool_runs",
+  "get_tool_run",
+  "wait_run",
+  "cancel_tool_run",
+  "wait_time",
+  "compress_context",
+  "finish",
+]
+worker_tools = [
+  "shell",
+  "spawn_agent",
+  "steer_agent",
+  "cancel_agent",
+  "list_agent_runs",
+  "get_agent_run",
+  "list_tool_runs",
+  "get_tool_run",
+  "wait_run",
+  "cancel_tool_run",
+  "wait_time",
+  "compress_context",
+  "finish",
+]
+list_default_limit = 20
+list_max_limit = 200
+shell_inline_wait_seconds = 8
+
+[extensions]
+sandbox_enabled = false
+mcp_enabled = false
+skills_enabled = false
