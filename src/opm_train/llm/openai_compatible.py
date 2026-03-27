@@ -32,7 +32,9 @@ class SseParser:
         while "\n\n" in self._buffer:
             raw, self._buffer = self._buffer.split("\n\n", 1)
             lines = []
-            for line in raw.splitlines():
+            # Use explicit LF splitting only; splitlines() treats Unicode line
+            # separators (for example U+2028) as hard breaks inside JSON strings.
+            for line in raw.split("\n"):
                 if line.startswith("data:"):
                     lines.append(line[5:].strip())
             if lines:

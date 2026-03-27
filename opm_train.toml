@@ -52,38 +52,48 @@ max_context_tokens = 96000
 
 [runtime.tools]
 root_tools = [
-  "spawn_agent",
-  "steer_agent",
-  "cancel_agent",
+  "shell",
+  "compress_context",
+  "wait_time",
+  "list_mcp_servers",
+  "list_mcp_resources",
+  "read_mcp_resource",
   "list_agent_runs",
   "get_agent_run",
+  "spawn_agent",
+  "cancel_agent",
+  "steer_agent",
   "list_tool_runs",
   "get_tool_run",
   "wait_run",
   "cancel_tool_run",
-  "wait_time",
-  "compress_context",
   "finish",
 ]
 worker_tools = [
-  "spawn_agent",
-  "steer_agent",
-  "cancel_agent",
+  "shell",
+  "compress_context",
+  "wait_time",
+  "list_mcp_servers",
+  "list_mcp_resources",
+  "read_mcp_resource",
   "list_agent_runs",
   "get_agent_run",
+  "spawn_agent",
+  "cancel_agent",
+  "steer_agent",
   "list_tool_runs",
   "get_tool_run",
   "wait_run",
   "cancel_tool_run",
-  "wait_time",
-  "compress_context",
   "finish",
 ]
 list_default_limit = 20
 list_max_limit = 200
-shell_timeout_seconds = 60
-wait_run_timeout_seconds = 0
-shell_inline_wait_seconds = 8
+shell_timeout_seconds = 300
+wait_run_timeout_seconds = 20
+shell_inline_wait_seconds = 5
+wait_time_min_seconds = 10
+wait_time_max_seconds = 60
 
 [extensions]
 sandbox_enabled = false

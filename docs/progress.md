@@ -4,6 +4,11 @@
 
 - Changed `spawn_agent` capacity behavior (`max_active_agents` / `max_children_per_agent`): runtime now returns a structured `status: rejected` payload to the caller agent instead of raising a tool execution exception, and records the spawn tool run as `completed` with rejection details.
 - Added regression coverage for capacity-limited spawn behavior to ensure no child agent is created and the rejection remains observable through tool results.
+- Restored `shell` in `opm_train.toml` runtime tool allow-lists for both root and worker roles, aligned with default runtime/tooling contract.
+- Hardened JSONL readers in `SessionStorage` (`load_events`, `load_turns`) to stream physical lines instead of `splitlines()`, preventing `U+2028` content from corrupting JSON decoding.
+- Hardened SSE parsing to split only on protocol LF boundaries (not `splitlines()`), preventing Unicode line-separator content inside `data:` JSON payloads from being truncated.
+- Added doctor contract guard for missing core runtime tool set (`shell` + agent/tool inspection/control + `compress_context` + `finish`).
+- Fixed mypy typing issue in spawn rejection event payload logging and added regression tests for shell allow-list, Unicode JSONL/SSE handling, and missing-core-tools doctor reporting.
 
 ## 2026-03-24
 

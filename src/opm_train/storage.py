@@ -199,12 +199,16 @@ class SessionStorage:
         if not path.exists():
             return []
         events: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            if isinstance(payload, dict):
-                events.append(payload)
+        # Stream physical lines instead of splitlines(); Unicode line-separator
+        # codepoints (for example U+2028) are valid inside JSON strings.
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    events.append(payload)
         return events
 
     def load_turns(
@@ -221,22 +225,24 @@ class SessionStorage:
         agent_filter = str(agent_id).strip() if agent_id is not None else None
         step_filter = int(step) if step is not None else None
         turns: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            if not isinstance(payload, dict):
-                continue
-            if agent_filter is not None and str(payload.get("agent_id", "")).strip() != agent_filter:
-                continue
-            if step_filter is not None:
-                try:
-                    payload_step = int(payload.get("step", -1))
-                except (TypeError, ValueError):
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
                     continue
-                if payload_step != step_filter:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
                     continue
-            turns.append(payload)
+                if agent_filter is not None and str(payload.get("agent_id", "")).strip() != agent_filter:
+                    continue
+                if step_filter is not None:
+                    try:
+                        payload_step = int(payload.get("step", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if payload_step != step_filter:
+                        continue
+                turns.append(payload)
         return turns
 
     def agent_llm_call_request_path(

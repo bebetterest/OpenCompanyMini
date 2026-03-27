@@ -98,6 +98,18 @@ def _default_specs() -> list[ToolSpec]:
             executor=_method_executor("_tool_wait_time", include_action=True),
         ),
         ToolSpec(
+            name="list_mcp_servers",
+            executor=_method_executor("_tool_list_mcp_servers", include_action=True),
+        ),
+        ToolSpec(
+            name="list_mcp_resources",
+            executor=_method_executor("_tool_list_mcp_resources", include_action=True),
+        ),
+        ToolSpec(
+            name="read_mcp_resource",
+            executor=_method_executor("_tool_read_mcp_resource", include_action=True),
+        ),
+        ToolSpec(
             name="compress_context",
             executor=_method_executor("_tool_compress_context", include_agent=True),
         ),

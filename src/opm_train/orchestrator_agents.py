@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
-from opm_train.context import maybe_auto_compress
+from opm_train.context import compress_context, maybe_auto_compress
 from opm_train.loop import ActionBatchResult, AgentLoopRunner
 from opm_train.loop_hooks import LoopContext
 from opm_train.models import AgentNode, AgentRole, AgentStatus, ToolRun
@@ -18,7 +18,14 @@ from opm_train.protocol import (
     normalize_actions,
     normalize_tool_calls,
 )
-from opm_train.tools import TERMINAL_AGENT_STATUSES, TERMINAL_TOOL_RUN_STATUSES, validate_finish_action
+from opm_train.tools import (
+    TERMINAL_AGENT_STATUSES,
+    TERMINAL_TOOL_RUN_STATUSES,
+    validate_compress_context_action,
+    validate_finish_action,
+    validate_wait_run_action,
+    validate_wait_time_action,
+)
 from opm_train.utils import json_ready, utc_now
 
 _INVALID_MODEL_PAYLOAD_SUMMARY = "Model returned invalid action payload."
@@ -283,7 +290,7 @@ class OrchestratorAgentLifecycleMixin:
         """Assemble context, call model, and normalize response into actions."""
         with self._timer_scope("ask_agent", agent=agent):
             self._ensure_active_turn(agent=agent)
-            self._maybe_record_auto_compression(agent)
+            await self._maybe_record_auto_compression(agent)
             self._apply_pending_steers(agent)
 
             profile = self.config.provider.active_profile()
@@ -504,17 +511,25 @@ class OrchestratorAgentLifecycleMixin:
 
         return on_token, on_reasoning, on_retry
 
-    def _maybe_record_auto_compression(self, agent: AgentNode) -> None:
+    async def _maybe_record_auto_compression(self, agent: AgentNode) -> None:
         """Trigger auto-compress and persist actual compression outcome."""
         metadata = agent.metadata if isinstance(agent.metadata, dict) else {}
         summary_version_before = int(metadata.get("summary_version", 0) or 0)
         triggered = maybe_auto_compress(agent=agent, config=self.config)
         if not triggered:
             return
+        compression_result = await compress_context(
+            agent=agent,
+            reason="auto_threshold",
+            config=self.config,
+            prompt_library=self.prompt_library,
+            llm_client=self.llm_client,
+        )
         metadata_after = agent.metadata if isinstance(agent.metadata, dict) else {}
         summary_version_after = int(metadata_after.get("summary_version", 0) or 0)
         compression_result = {
-            "compressed": summary_version_after > summary_version_before,
+            **compression_result,
+            "compressed": bool(compression_result.get("compressed", False)) and summary_version_after > summary_version_before,
             "summary_version": summary_version_after,
             "summarized_until_message_index": int(metadata_after.get("summarized_until_message_index", -1) or -1),
         }
@@ -648,18 +663,49 @@ class OrchestratorAgentLifecycleMixin:
                 error_code="tool_not_enabled_for_role",
                 error_message=f"tool '{action_type}' is not enabled for role {agent.role.value}",
             )
+        validation_error = self._validate_action_before_submit(agent=agent, action=action)
+        if validation_error:
+            return {
+                "error": validation_error,
+                "error_code": "invalid_arguments",
+                "action": json_ready(action),
+                "available_tools": list(self.config.runtime.tools.tool_names_for_role(agent.role.value)),
+            }
 
         if action_type == "finish":
             return self._handle_finish_action(agent=agent, action=action)
         return await self._execute_tool_action(agent=agent, action=action)
 
+    def _validate_action_before_submit(self, *, agent: AgentNode, action: dict[str, Any]) -> str | None:
+        """Validate selected action schemas before creating a tool run."""
+        action_type = str(action.get("type", "")).strip()
+        if action_type == "finish":
+            return validate_finish_action(agent.role, action)
+        if action_type == "wait_time":
+            return validate_wait_time_action(action, config=self.config)
+        if action_type == "wait_run":
+            return validate_wait_run_action(action)
+        if action_type == "compress_context":
+            return validate_compress_context_action(action)
+        return None
+
     def _handle_finish_action(self, *, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize finish action into loop return payload."""
         error = validate_finish_action(agent.role, action)
         if error:
-            raise ValueError(error)
+            return {"accepted": False, "error": error}
         if self._has_unfinished_children(agent):
-            raise ValueError("cannot finish while child agents are still active")
+            pending_children = [
+                child_id
+                for child_id in agent.children
+                if (child := self.agents.get(child_id))
+                and child.status.value not in TERMINAL_AGENT_STATUSES
+            ]
+            return {
+                "accepted": False,
+                "error": "Cannot finish while unfinished child agents still exist.",
+                "pending_children": pending_children,
+            }
         unfinished_runs = self._unfinished_tool_runs_for_agent(agent)
         if unfinished_runs:
             return self._finish_rejected_result(agent=agent, unfinished_runs=unfinished_runs)
@@ -669,14 +715,13 @@ class OrchestratorAgentLifecycleMixin:
         }
         if agent.role == AgentRole.WORKER:
             payload["next_recommendation"] = str(action.get("next_recommendation", "")).strip()
-        return {"ok": True, "finish_payload": payload}
+        return {"accepted": True, "finish_payload": payload}
 
     def _finish_rejected_result(self, *, agent: AgentNode, unfinished_runs: list[dict[str, Any]]) -> dict[str, Any]:
         """Build structured finish-rejected payload and corresponding event log."""
         result = {
-            "ok": False,
-            "finish_rejected": True,
-            "error": "cannot finish while own tool runs are still active",
+            "accepted": False,
+            "error": "Cannot finish while own tool runs are still active.",
             "unfinished_tool_runs": unfinished_runs,
         }
         self._log_event(
@@ -734,15 +779,15 @@ class OrchestratorAgentLifecycleMixin:
     def _unfinished_tool_run_item(run: ToolRun) -> dict[str, Any]:
         """Convert one active tool run object into finish-rejection payload shape."""
         return {
-            "run_id": run.id,
+            "tool_run_id": run.id,
             "tool_name": run.tool_name,
             "status": run.status.value,
             "blocking": run.blocking,
             "created_at": run.created_at,
         }
 
-    def _cancel_agent_tree(self, agent_id: str, *, reason: str) -> list[str]:
-        """Cancel target agent and descendants, returning cancelled IDs."""
+    def _cancel_agent_tree(self, agent_id: str, *, reason: str, recursive: bool = True) -> list[str]:
+        """Cancel target agent subtree (or only target) and return cancelled ids."""
         if agent_id not in self.agents:
             return []
         cancelled: list[str] = []
@@ -752,8 +797,9 @@ class OrchestratorAgentLifecycleMixin:
             agent = self.agents.get(current_id)
             if agent is None:
                 return
-            for child_id in list(agent.children):
-                walk(child_id)
+            if recursive:
+                for child_id in list(agent.children):
+                    walk(child_id)
             if agent.status.value not in TERMINAL_AGENT_STATUSES:
                 agent.status = AgentStatus.CANCELLED
                 agent.status_reason = reason

@@ -58,7 +58,6 @@ class BlockingSpawnLLM:
                                 "type": "spawn_agent",
                                 "name": "Inspect",
                                 "instruction": "Inspect the repository",
-                                "blocking": True,
                             }
                         ]
                     }
@@ -110,7 +109,6 @@ class WaitRunLLM:
                                 "type": "spawn_agent",
                                 "name": "Slow",
                                 "instruction": "slow child",
-                                "blocking": False,
                             }
                         ]
                     }
@@ -122,8 +120,7 @@ class WaitRunLLM:
                         "actions": [
                             {
                                 "type": "wait_run",
-                                "run_id": str(tool_payload.get("tool_run_id", "")),
-                                "timeout_seconds": 2,
+                                "tool_run_id": str(tool_payload.get("tool_run_id", "")),
                             }
                         ]
                     }
@@ -144,7 +141,7 @@ class WaitRunLLM:
 
         self.worker_calls += 1
         if self.worker_calls == 1:
-            text = json.dumps({"actions": [{"type": "wait_time", "seconds": 0.02}]})
+            text = json.dumps({"actions": [{"type": "list_agent_runs", "limit": 1}]})
         else:
             text = json.dumps(
                 {
@@ -178,7 +175,6 @@ class FinishRejectedThenWaitLLM:
                         {
                             "type": "shell",
                             "command": "python -c \"import time;time.sleep(1);print('done')\"",
-                            "blocking": False,
                         }
                     ]
                 }
@@ -196,17 +192,18 @@ class FinishRejectedThenWaitLLM:
                 }
             )
         elif self.root_calls == 3:
-            self.saw_finish_rejection = bool(tool_payload.get("finish_rejected"))
+            self.saw_finish_rejection = bool(
+                tool_payload.get("accepted") is False and isinstance(tool_payload.get("unfinished_tool_runs"), list)
+            )
             unfinished = tool_payload.get("unfinished_tool_runs")
             if isinstance(unfinished, list) and unfinished:
-                self.shell_run_id = str((unfinished[0] or {}).get("run_id", "")).strip()
+                self.shell_run_id = str((unfinished[0] or {}).get("tool_run_id", "")).strip()
             text = json.dumps(
                 {
                     "actions": [
                         {
                             "type": "wait_run",
-                            "run_id": self.shell_run_id,
-                            "timeout_seconds": 3,
+                            "tool_run_id": self.shell_run_id,
                         }
                     ]
                 }
@@ -247,7 +244,6 @@ class SteerAndCancelLLM:
                                 "type": "spawn_agent",
                                 "name": "Steered",
                                 "instruction": "react to steer",
-                                "blocking": False,
                             }
                         ]
                     }
@@ -293,7 +289,21 @@ class SteerAndCancelLLM:
         self.worker_calls += 1
         if "please include STEERED" in json.dumps(messages, ensure_ascii=False):
             self.worker_received_steer = True
-        text = json.dumps({"actions": [{"type": "wait_time", "seconds": 0.5}]})
+        if self.worker_received_steer:
+            text = json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "completed",
+                            "summary": "STEERED",
+                            "next_recommendation": "none",
+                        }
+                    ]
+                }
+            )
+        else:
+            text = json.dumps({"actions": [{"type": "list_agent_runs", "limit": 1}]})
         return ChatResult(content=text, raw_events=[])
 
 
@@ -349,8 +359,7 @@ class SpawnDefaultNonBlockingLLM:
                         "actions": [
                             {
                                 "type": "wait_run",
-                                "run_id": str(tool_payload.get("tool_run_id", "")),
-                                "timeout_seconds": 2,
+                                "tool_run_id": str(tool_payload.get("tool_run_id", "")),
                             }
                         ]
                     }
@@ -403,25 +412,23 @@ class FailingWorkerVisibleErrorLLM:
                                 "type": "spawn_agent",
                                 "name": "CrashWorker",
                                 "instruction": "return invalid finish payload",
-                                "blocking": False,
                             }
                         ]
                     }
                 )
             elif self.root_calls == 2:
+                self.child_agent_id = str(tool_payload.get("child_agent_id", "")).strip()
                 text = json.dumps(
                     {
                         "actions": [
                             {
                                 "type": "wait_run",
-                                "run_id": str(tool_payload.get("tool_run_id", "")),
-                                "timeout_seconds": 2,
+                                "tool_run_id": str(tool_payload.get("tool_run_id", "")),
                             }
                         ]
                     }
                 )
             elif self.root_calls == 3:
-                self.child_agent_id = str(((tool_payload.get("result") or {}).get("child_agent_id", ""))).strip()
                 text = json.dumps(
                     {
                         "actions": [
@@ -443,11 +450,21 @@ class FailingWorkerVisibleErrorLLM:
                             }
                         ]
                     }
-                )
+            )
             return ChatResult(content=text, raw_events=[])
 
-        # Missing summary on finish -> runtime validation error in worker loop.
-        text = json.dumps({"actions": [{"type": "finish", "status": "completed"}]})
+        text = json.dumps(
+            {
+                "actions": [
+                    {
+                        "type": "finish",
+                        "status": "failed",
+                        "summary": "worker failed intentionally",
+                        "next_recommendation": "retry",
+                    }
+                ]
+            }
+        )
         return ChatResult(content=text, raw_events=[])
 
 
@@ -462,7 +479,7 @@ class RootCancelBlockedLLM:
         if self.root_calls == 1:
             text = json.dumps({"actions": [{"type": "list_agent_runs", "limit": 10}]})
         elif self.root_calls == 2:
-            root_id = str((tool_payload.get("items") or [{}])[0].get("id", ""))
+            root_id = str((tool_payload.get("agent_runs") or [{}])[0].get("id", ""))
             text = json.dumps({"actions": [{"type": "cancel_agent", "agent_id": root_id}]})
         else:
             text = json.dumps({"actions": [{"type": "finish", "status": "partial", "summary": "root cancel blocked"}]})
@@ -482,7 +499,7 @@ class CancelUnknownAgentLLM:
                 raw_events=[],
             )
         payload = _extract_last_tool_payload(kwargs["messages"])
-        self.saw_unknown_agent_error = str(((payload.get("error") or {}).get("code") or "")) == "unknown_agent_id"
+        self.saw_unknown_agent_error = str(payload.get("error_code", "")) == "unknown_agent_id"
         return ChatResult(
             content=json.dumps(
                 {
@@ -502,6 +519,8 @@ class CancelUnknownAgentLLM:
 class BlockingSpawnFailedStatusLLM:
     def __init__(self) -> None:
         self.root_calls = 0
+        self.child_agent_id = ""
+        self.spawn_run_id = ""
         self.spawn_status = ""
 
     async def stream_chat(self, **kwargs: Any) -> ChatResult:
@@ -518,7 +537,6 @@ class BlockingSpawnFailedStatusLLM:
                                     "type": "spawn_agent",
                                     "name": "FailingChild",
                                     "instruction": "worker must fail",
-                                    "blocking": True,
                                 }
                             ]
                         }
@@ -526,7 +544,19 @@ class BlockingSpawnFailedStatusLLM:
                     raw_events=[],
                 )
             tool_payload = _extract_last_tool_payload(messages)
-            self.spawn_status = str(tool_payload.get("status", ""))
+            if self.root_calls == 2:
+                self.child_agent_id = str(tool_payload.get("child_agent_id", ""))
+                self.spawn_run_id = str(tool_payload.get("tool_run_id", ""))
+                return ChatResult(
+                    content=json.dumps({"actions": [{"type": "wait_run", "tool_run_id": self.spawn_run_id}]}),
+                    raw_events=[],
+                )
+            if self.root_calls == 3:
+                return ChatResult(
+                    content=json.dumps({"actions": [{"type": "get_agent_run", "agent_id": self.child_agent_id}]}),
+                    raw_events=[],
+                )
+            self.spawn_status = str(((tool_payload.get("agent_run") or {}).get("status") or ""))
             return ChatResult(
                 content=json.dumps(
                     {
@@ -566,7 +596,7 @@ class StepCountLLM:
     async def stream_chat(self, **kwargs: Any) -> ChatResult:
         self.root_calls += 1
         if self.root_calls == 1:
-            text = json.dumps({"actions": [{"type": "wait_time", "seconds": 0}]})
+            text = json.dumps({"actions": [{"type": "list_agent_runs", "limit": 1}]})
         else:
             text = json.dumps({"actions": [{"type": "finish", "status": "completed", "summary": "done"}]})
         return ChatResult(content=text, raw_events=[])
@@ -651,7 +681,7 @@ class ToolCallReplaySchemaLLM:
                         "type": "function",
                         "function": {
                             "name": "wait_time",
-                            "arguments": "{\"seconds\":0}",
+                            "arguments": "{\"seconds\":10}",
                         },
                     }
                 ],
@@ -673,7 +703,7 @@ class ToolCallReplaySchemaLLM:
             and first_call.get("type") == "function"
             and isinstance(function_payload, dict)
             and function_payload.get("name") == "wait_time"
-            and function_payload.get("arguments") == "{\"seconds\":0}"
+            and function_payload.get("arguments") == "{\"seconds\":10}"
         )
 
         return ChatResult(
@@ -754,6 +784,7 @@ async def test_finish_is_rejected_until_agent_own_tool_runs_are_terminal() -> No
         project = Path(temp_dir)
         llm = FinishRejectedThenWaitLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        orchestrator.config.runtime.tools.shell_inline_wait_seconds = 0.05
         session = await orchestrator.run_task("test finish rejection on active own tool run")
         assert session.status.value == "completed"
         assert llm.saw_finish_rejection is True
@@ -765,7 +796,11 @@ async def test_finish_is_rejected_until_agent_own_tool_runs_are_terminal() -> No
             for message in root.conversation
             if str(message.get("role", "")) == "tool" and str(message.get("content", "")).strip().startswith("{")
         ]
-        assert any(bool(payload.get("finish_rejected")) for payload in tool_payloads if isinstance(payload, dict))
+        assert any(
+            payload.get("accepted") is False and isinstance(payload.get("unfinished_tool_runs"), list)
+            for payload in tool_payloads
+            if isinstance(payload, dict)
+        )
 
 
 @pytest.mark.asyncio
@@ -807,8 +842,8 @@ async def test_resume_marks_non_restorable_tool_runs_as_abandoned() -> None:
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
         root_id = str(snapshot["session"]["root_agent_id"])
 
-        snapshot["tool_runs"]["tool-stale"] = {
-            "id": "tool-stale",
+        snapshot["tool_runs"]["toolrun-stale"] = {
+            "id": "toolrun-stale",
             "session_id": session.id,
             "agent_id": root_id,
             "tool_name": "shell",
@@ -825,7 +860,7 @@ async def test_resume_marks_non_restorable_tool_runs_as_abandoned() -> None:
 
         second = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
         await second.resume(session.id, "continue")
-        stale = second.tool_runs["tool-stale"]
+        stale = second.tool_runs["toolrun-stale"]
         assert stale.status.value == "abandoned"
         assert stale.error == "tool_run_abandoned_on_resume"
 
@@ -911,7 +946,7 @@ async def test_spawn_agent_capacity_limit_returns_structured_rejected_result() -
 
         assert result["status"] == "rejected"
         assert result["child_agent_id"] is None
-        assert result["error"]["code"] == "max_active_agents_limit_reached"
+        assert result["error_code"] == "max_active_agents_limit_reached"
         assert result["capacity"]["active_agents"] >= 1
         assert len(root.children) == 0
         assert len(orchestrator.agents) == 1
@@ -925,20 +960,20 @@ async def test_spawn_agent_capacity_limit_returns_structured_rejected_result() -
 
 
 @pytest.mark.asyncio
-async def test_wait_run_rejects_non_numeric_timeout() -> None:
+async def test_wait_run_rejects_timeout_field() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
-        with pytest.raises(ValueError, match="timeout_seconds must be numeric"):
-            await orchestrator._tool_wait_run({"run_id": "tool-1", "timeout_seconds": "abc"})
+        result = await orchestrator._tool_wait_run({"tool_run_id": "toolrun-1", "timeout_seconds": "abc"})
+        assert result["wait_run_status"] is False
+        assert "unsupported field(s)" in str(result.get("error", ""))
 
 
 @pytest.mark.asyncio
-async def test_wait_run_uses_config_default_timeout_when_not_provided() -> None:
+async def test_wait_run_requires_exactly_one_target_and_returns_terminal_status() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
-        orchestrator.config.runtime.tools.wait_run_timeout_seconds = 0.01
         agent = AgentNode(
             id="agent-1",
             session_id="session-1",
@@ -954,10 +989,12 @@ async def test_wait_run_uses_config_default_timeout_when_not_provided() -> None:
             blocking=False,
         )
         orchestrator._mark_tool_run_running(run)
-        result = await orchestrator._tool_wait_run({"run_id": run.id})
-        assert result["timed_out"] is True
-        assert result["timeout_seconds"] == pytest.approx(0.01)
-        assert result["status"] == "running"
+        orchestrator._complete_tool_run(run, result={"exit_code": 0})
+        invalid = await orchestrator._tool_wait_run({})
+        assert invalid["wait_run_status"] is False
+        assert "requires exactly one of 'tool_run_id' or 'agent_id'" in str(invalid.get("error", ""))
+        result = await orchestrator._tool_wait_run({"tool_run_id": run.id})
+        assert result["wait_run_status"] is True
 
 
 @pytest.mark.asyncio
@@ -1002,7 +1039,7 @@ async def test_finish_rejection_checks_only_current_agent_tool_runs() -> None:
                 "summary": "worker can finish when only root has running tool",
             },
         )
-        assert allowed.get("ok") is True
+        assert allowed.get("accepted") is True
         assert isinstance(allowed.get("finish_payload"), dict)
 
         worker_run = orchestrator._create_tool_run(
@@ -1020,14 +1057,14 @@ async def test_finish_rejection_checks_only_current_agent_tool_runs() -> None:
                 "summary": "should be rejected",
             },
         )
-        assert rejected.get("finish_rejected") is True
+        assert rejected.get("accepted") is False
         unfinished = rejected.get("unfinished_tool_runs")
         assert isinstance(unfinished, list)
-        assert [item["run_id"] for item in unfinished] == [worker_run.id]
+        assert [item["tool_run_id"] for item in unfinished] == [worker_run.id]
 
 
 @pytest.mark.asyncio
-async def test_cancel_tool_run_does_not_cancel_spawned_child_agent() -> None:
+async def test_cancel_tool_run_cancels_spawned_child_agent_subtree() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=SteerAndCancelLLM())
@@ -1057,11 +1094,12 @@ async def test_cancel_tool_run_does_not_cancel_spawned_child_agent() -> None:
         )
 
         child_id = str(result["child_agent_id"])
-        cancel_result = await orchestrator._tool_cancel_tool_run({"run_id": run.id})
+        cancel_result = await orchestrator._tool_cancel_tool_run({"tool_run_id": run.id})
 
-        assert cancel_result["status"] == "cancelled"
-        assert orchestrator.agents[child_id].status != AgentStatus.CANCELLED
-        assert run.error == "cancel_tool_run"
+        assert cancel_result["final_status"] == "cancelled"
+        assert int(cancel_result["cancelled_agents_count"]) >= 1
+        assert orchestrator.agents[child_id].status == AgentStatus.CANCELLED
+        assert run.error == f"Tool run cancelled by agent {run.agent_id}."
 
 
 @pytest.mark.asyncio
@@ -1085,7 +1123,7 @@ async def test_shell_finishes_inline_within_shell_inline_wait_seconds() -> None:
             blocking=True,
         )
         orchestrator._mark_tool_run_running(run)
-        result = await orchestrator._tool_shell(run, {"command": "printf inline-ok", "timeout_seconds": 5})
+        result = await orchestrator._tool_shell(run, {"command": "printf inline-ok"})
         assert run.status.value == "completed"
         assert result["exit_code"] == 0
         assert result["stdout"] == "inline-ok"
@@ -1113,13 +1151,13 @@ async def test_shell_uses_config_default_timeout_and_reports_timeout_details() -
             blocking=True,
         )
         orchestrator._mark_tool_run_running(run)
-        with pytest.raises(ValueError, match="timed out after 1s"):
-            await orchestrator._tool_shell(run, {"command": "python -c \"import time;time.sleep(2)\""})
+        result = await orchestrator._tool_shell(run, {"command": "python -c \"import time;time.sleep(2)\""})
         assert run.status.value == "failed"
         assert run.error == "shell command timed out after 1s"
         assert isinstance(run.result, dict)
         assert run.result["timed_out"] is True
         assert run.result["timeout_seconds"] == 1.0
+        assert result["timed_out"] is True
 
 
 @pytest.mark.asyncio
@@ -1149,23 +1187,23 @@ async def test_shell_exceeds_inline_wait_then_get_tool_run_shows_cumulative_outp
             blocking=True,
         )
         orchestrator._mark_tool_run_running(run)
-        response = await orchestrator._tool_shell(run, {"command": command, "timeout_seconds": 5})
+        response = await orchestrator._tool_shell(run, {"command": command})
         assert response["status"] == "running"
         assert run.status.value == "running"
 
         stdout_seen = ""
         for _ in range(100):
-            detail = orchestrator._tool_get_tool_run({"run_id": run.id})
-            stdout_seen = str((detail.get("result") or {}).get("stdout", ""))
+            detail = orchestrator._tool_get_tool_run({"tool_run_id": run.id})
+            stdout_seen = str(((detail.get("tool_run") or {}).get("stdout") or ""))
             if "start" in stdout_seen:
                 break
             await asyncio.sleep(0.01)
         assert "start" in stdout_seen
 
-        wait_result = await orchestrator._tool_wait_run({"run_id": run.id, "timeout_seconds": 2})
-        assert wait_result["timed_out"] is False
-        assert wait_result["status"] == "completed"
-        assert "end" in str((wait_result.get("result") or {}).get("stdout", ""))
+        wait_result = await orchestrator._tool_wait_run({"tool_run_id": run.id})
+        assert wait_result["wait_run_status"] is True
+        final_detail = orchestrator._tool_get_tool_run({"tool_run_id": run.id, "include_result": True})
+        assert "end" in str((((final_detail.get("tool_run") or {}).get("result") or {}).get("stdout", "")))
 
 
 @pytest.mark.asyncio
@@ -1181,27 +1219,19 @@ async def test_shell_background_internal_error_marks_run_failed() -> None:
             instruction="run shell",
             workspace_path=project,
         )
-        run = orchestrator._create_tool_run(
+        result = await orchestrator._execute_tool_action(
             agent=agent,
-            tool_name="shell",
-            arguments={"type": "shell", "command": "echo hi", "cwd": "missing-dir"},
-            blocking=False,
+            action={"type": "shell", "command": "echo hi", "cwd": "missing-dir"},
         )
-        orchestrator._mark_tool_run_running(run)
-        response = await orchestrator._tool_shell(
-            run,
-            {"command": "echo hi", "cwd": "missing-dir", "timeout_seconds": 5},
-        )
-        assert response["status"] == "running"
-
-        wait_result = await orchestrator._tool_wait_run({"run_id": run.id, "timeout_seconds": 2})
-        assert wait_result["timed_out"] is False
-        assert wait_result["status"] == "failed"
-        assert str(wait_result.get("error", "")).strip()
+        assert str(result.get("error", "")).strip()
+        shell_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "shell"]
+        assert len(shell_runs) == 1
+        assert shell_runs[0].status.value == "failed"
+        assert str(shell_runs[0].error or "").strip()
 
 
 @pytest.mark.asyncio
-async def test_worker_exception_recorded_and_visible_via_get_agent_run() -> None:
+async def test_worker_failure_visible_via_get_agent_run() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         llm = FailingWorkerVisibleErrorLLM()
@@ -1210,15 +1240,7 @@ async def test_worker_exception_recorded_and_visible_via_get_agent_run() -> None
         assert session.status.value == "completed"
         assert llm.child_agent_id
         detail = orchestrator._tool_get_agent_run({"agent_id": llm.child_agent_id})
-        assert detail["status"] == "failed"
-        assert "agent_loop_error:ValueError" in str(detail.get("status_reason", ""))
-        assert isinstance(detail.get("last_error"), dict)
-        assert detail["last_error"]["type"] == "ValueError"
-        errors_path = orchestrator.storage.errors_path(session.id)
-        assert errors_path.exists()
-        error_lines = [json.loads(line) for line in errors_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert error_lines
-        assert any(str(item.get("error_type", "")) == "ValueError" for item in error_lines)
+        assert str(((detail.get("agent_run") or {}).get("status") or "")) == "failed"
 
 
 @pytest.mark.asyncio
@@ -1232,8 +1254,8 @@ async def test_cancel_agent_cannot_cancel_root() -> None:
         cancel_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "cancel_agent"]
         assert len(cancel_runs) == 1
         assert cancel_runs[0].result is not None
-        assert cancel_runs[0].result["blocked"] is True
-        assert cancel_runs[0].result["reason"] == "root_agent_not_cancellable"
+        assert cancel_runs[0].result["cancel_agent_status"] is False
+        assert "cannot target the current root agent" in str(cancel_runs[0].result["error"])
 
 
 @pytest.mark.asyncio
@@ -1269,9 +1291,7 @@ async def test_missing_tool_name_returns_failed_tool_run_payload() -> None:
         orchestrator._reset_runtime_trackers()
 
         result = await orchestrator._execute_action(agent=root, action={})
-        assert result["ok"] is False
-        assert result["tool_name"] == "<missing>"
-        assert result["error"]["code"] == "missing_tool_name"
+        assert result["error_code"] == "missing_tool_name"
 
         failed_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "<missing>"]
         assert len(failed_runs) == 1
@@ -1297,9 +1317,7 @@ async def test_disabled_tool_name_returns_failed_tool_run_payload() -> None:
         orchestrator._reset_runtime_trackers()
 
         result = await orchestrator._execute_action(agent=root, action={"type": "not_enabled_tool"})
-        assert result["ok"] is False
-        assert result["tool_name"] == "not_enabled_tool"
-        assert result["error"]["code"] == "tool_not_enabled_for_role"
+        assert result["error_code"] == "tool_not_enabled_for_role"
 
         failed_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "not_enabled_tool"]
         assert len(failed_runs) == 1

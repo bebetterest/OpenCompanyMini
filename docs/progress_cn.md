@@ -4,6 +4,11 @@
 
 - 调整 `spawn_agent` 容量上限行为（`max_active_agents` / `max_children_per_agent`）：运行时不再以工具执行异常直接抛错，而是向调用方 agent 返回结构化 `status: rejected` 结果；对应 spawn tool run 记为 `completed` 并带拒绝细节。
 - 增加容量受限 spawn 的回归测试，确保不会创建子代理，且拒绝信息可通过 tool 结果稳定观测。
+- 在 `opm_train.toml` 中恢复 root/worker 两侧 `shell` 工具放行，和默认运行时工具契约重新对齐。
+- 加固 `SessionStorage` 的 JSONL 读取（`load_events`、`load_turns`）：改为按物理行流式读取，不再使用 `splitlines()`，避免 `U+2028` 内容破坏 JSON 解码。
+- 加固 SSE 解析：仅按协议 LF 边界切分，不再使用 `splitlines()`，避免 `data:` JSON 内 Unicode 行分隔符导致事件被截断。
+- `doctor` 契约检查新增“核心工具集缺项”守卫（`shell` + agent/tool 查询控制 + `compress_context` + `finish`）。
+- 修复 spawn 拒绝事件日志的 mypy 类型问题，并补充 shell allow-list、Unicode JSONL/SSE、doctor 核心工具缺项检测的回归测试。
 
 ## 2026-03-24
 

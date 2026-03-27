@@ -124,7 +124,7 @@ class OrchestratorSessionLifecycleMixin:
         return self.session
 
     def _restore_tool_runs_after_resume(self) -> None:
-        """Restore tool waiters and fail non-terminal runs during resume."""
+        """Restore tool waiters and abandon non-terminal runs during resume."""
         for run in self.tool_runs.values():
             event = asyncio.Event()
             if run.status.value in TERMINAL_TOOL_RUN_STATUSES:

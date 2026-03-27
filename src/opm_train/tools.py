@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any
 
 from opm_train.config import OPMTrainConfig
@@ -29,6 +30,26 @@ _ALLOWED_FINISH_STATUS_BY_ROLE = {
 }
 
 _RUNTIME_ROLES = ("root", "worker")
+_REQUIRED_CORE_TOOL_NAMES = frozenset(
+    {
+        "shell",
+        "compress_context",
+        "wait_time",
+        "list_mcp_servers",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "spawn_agent",
+        "cancel_agent",
+        "steer_agent",
+        "list_agent_runs",
+        "get_agent_run",
+        "list_tool_runs",
+        "get_tool_run",
+        "wait_run",
+        "cancel_tool_run",
+        "finish",
+    }
+)
 
 
 def tool_definitions_for_role(
@@ -57,20 +78,22 @@ def tool_definitions_for_role(
                         limit_schema["minimum"] = 1
                         limit_schema["maximum"] = int(config.runtime.tools.list_max_limit)
                         limit_schema["default"] = int(config.runtime.tools.list_default_limit)
-                if isinstance(properties, dict) and name == "shell":
-                    _apply_timeout_default(
-                        properties=properties,
-                        key="timeout_seconds",
-                        default=float(config.runtime.tools.shell_timeout_seconds),
-                        minimum=1.0,
-                    )
-                if isinstance(properties, dict) and name == "wait_run":
-                    _apply_timeout_default(
-                        properties=properties,
-                        key="timeout_seconds",
-                        default=float(config.runtime.tools.wait_run_timeout_seconds),
-                        minimum=0.0,
-                    )
+                if name == "wait_time" and isinstance(properties, dict):
+                    seconds_schema = properties.get("seconds")
+                    if isinstance(seconds_schema, dict):
+                        wait_min, wait_max = config.runtime.tools.wait_time_bounds()
+                        seconds_schema["minimum"] = wait_min
+                        seconds_schema["maximum"] = wait_max
+                        current_desc = str(seconds_schema.get("description", "")).strip()
+                        if current_desc:
+                            if any("\u4e00" <= ch <= "\u9fff" for ch in current_desc):
+                                seconds_schema["description"] = (
+                                    f"必填等待秒数，必须 >= {wait_min:g} 且 <= {wait_max:g}。"
+                                )
+                            else:
+                                seconds_schema["description"] = (
+                                    f"Required wait duration in seconds. Must be >= {wait_min:g} and <= {wait_max:g}."
+                                )
                 if name == "finish":
                     _apply_finish_schema(params=params, role=role_name)
         resolved.append(item)
@@ -83,20 +106,17 @@ def _apply_finish_schema(*, params: dict[str, Any], role: str) -> None:
     if not isinstance(properties, dict):
         return
     status_schema = properties.get("status")
-    if isinstance(status_schema, dict):
-        allowed = sorted(_ALLOWED_FINISH_STATUS_BY_ROLE[AgentRole(role)])
-        status_schema["enum"] = allowed
+    if isinstance(status_schema, dict) and isinstance(status_schema.get("enum"), list):
+        enum_values = [str(item).strip() for item in status_schema.get("enum", [])]
+        if role == AgentRole.WORKER.value:
+            status_schema["enum"] = [value for value in enum_values if value != "interrupted"]
+        elif role == AgentRole.ROOT.value:
+            status_schema["enum"] = [value for value in enum_values if value in {"completed", "partial"}]
+        else:
+            allowed = sorted(_ALLOWED_FINISH_STATUS_BY_ROLE[AgentRole(role)])
+            status_schema["enum"] = allowed
     if role == AgentRole.ROOT.value:
         properties.pop("next_recommendation", None)
-
-
-def _apply_timeout_default(*, properties: dict[str, Any], key: str, default: float, minimum: float) -> None:
-    """Set timeout schema defaults from runtime config."""
-    timeout_schema = properties.get(key)
-    if not isinstance(timeout_schema, dict):
-        return
-    timeout_schema["default"] = float(default)
-    timeout_schema["minimum"] = float(minimum)
 
 
 def parse_list_limit(value: Any, *, config: OPMTrainConfig) -> int:
@@ -106,6 +126,14 @@ def parse_list_limit(value: Any, *, config: OPMTrainConfig) -> int:
 
 def validate_finish_action(role: AgentRole, action: dict[str, Any]) -> str | None:
     """Validate finish payload against role constraints."""
+    common_keys = {"type", "_tool_call_id", "status", "summary"}
+    worker_only_keys = {"next_recommendation"}
+    allowed_keys = common_keys if role == AgentRole.ROOT else (common_keys | worker_only_keys)
+    unknown_keys = sorted(key for key in action.keys() if key not in allowed_keys)
+    if unknown_keys:
+        joined = ", ".join(f"'{key}'" for key in unknown_keys)
+        return f"finish received unsupported field(s): {joined}."
+
     allowed_statuses = _ALLOWED_FINISH_STATUS_BY_ROLE[role]
 
     status = str(action.get("status", "")).strip().lower()
@@ -127,17 +155,51 @@ def validate_finish_action(role: AgentRole, action: dict[str, Any]) -> str | Non
     return None
 
 
-def validate_wait_time_action(action: dict[str, Any]) -> str | None:
+def validate_wait_time_action(action: dict[str, Any], *, config: OPMTrainConfig) -> str | None:
     """Validate wait_time action payload bounds."""
+    allowed_keys = {"type", "_tool_call_id", "seconds"}
+    unknown_keys = sorted(key for key in action.keys() if key not in allowed_keys)
+    if unknown_keys:
+        joined = ", ".join(f"'{key}'" for key in unknown_keys)
+        return f"wait_time received unsupported field(s): {joined}."
     raw_seconds = action.get("seconds")
     if raw_seconds is None:
-        return "wait_time requires numeric 'seconds'."
+        return "wait_time requires 'seconds'."
     try:
         seconds = float(raw_seconds)
     except (TypeError, ValueError):
-        return "wait_time requires numeric 'seconds'."
-    if seconds < 0.0 or seconds > 120.0:
-        return "wait_time seconds must be in [0, 120]."
+        return "wait_time field 'seconds' must be a number."
+    if not math.isfinite(seconds):
+        return "wait_time field 'seconds' must be finite."
+    wait_min, wait_max = config.runtime.tools.wait_time_bounds()
+    if seconds < wait_min:
+        return f"wait_time field 'seconds' must be >= {wait_min:g}."
+    if seconds > wait_max:
+        return f"wait_time field 'seconds' must be <= {wait_max:g}."
+    return None
+
+
+def validate_compress_context_action(action: dict[str, Any]) -> str | None:
+    """Validate compress_context does not receive extra fields."""
+    allowed_keys = {"type", "_tool_call_id"}
+    unknown_keys = sorted(key for key in action.keys() if key not in allowed_keys)
+    if unknown_keys:
+        joined = ", ".join(f"'{key}'" for key in unknown_keys)
+        return f"compress_context received unsupported field(s): {joined}."
+    return None
+
+
+def validate_wait_run_action(action: dict[str, Any]) -> str | None:
+    """Validate wait_run target contract and unsupported fields."""
+    allowed_keys = {"type", "_tool_call_id", "tool_run_id", "agent_id"}
+    unknown_keys = sorted(key for key in action.keys() if key not in allowed_keys)
+    if unknown_keys:
+        joined = ", ".join(f"'{key}'" for key in unknown_keys)
+        return f"wait_run received unsupported field(s): {joined}."
+    has_tool_run_id = bool(str(action.get("tool_run_id", "")).strip())
+    has_agent_id = bool(str(action.get("agent_id", "")).strip())
+    if has_tool_run_id == has_agent_id:
+        return "wait_run requires exactly one of 'tool_run_id' or 'agent_id'."
     return None
 
 
@@ -158,6 +220,9 @@ def runtime_tool_contract_issues(
     }
     for role_name in _RUNTIME_ROLES:
         enabled_tools = role_tools[role_name]
+        missing_core_tools = sorted(_REQUIRED_CORE_TOOL_NAMES - enabled_tools)
+        if missing_core_tools:
+            issues.append(_issue(role=role_name, kind="missing_core_tools", tool_names=missing_core_tools))
         missing_in_prompts = sorted(enabled_tools - prompt_tools)
         if missing_in_prompts:
             issues.append(_issue(role=role_name, kind="missing_prompt_definitions", tool_names=missing_in_prompts))

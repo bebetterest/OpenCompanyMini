@@ -75,6 +75,13 @@ def test_sse_parser_handles_crlf_and_mixed_chunk_boundaries() -> None:
     assert third[0] == "[DONE]"
 
 
+def test_sse_parser_keeps_unicode_line_separator_inside_data_json() -> None:
+    parser = SseParser()
+    payload = '{"choices":[{"delta":{"content":"Line A\u2028Line B"}}]}'
+    events = parser.feed(f"data: {payload}\n\n")
+    assert events == [payload]
+
+
 @pytest.mark.asyncio
 async def test_stream_chat_sends_tool_fields_and_parses_calls() -> None:
     client = OpenAICompatibleClient(

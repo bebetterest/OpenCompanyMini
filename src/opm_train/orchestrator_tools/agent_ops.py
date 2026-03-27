@@ -15,7 +15,7 @@ class AgentToolMixin:
     spawn_run_by_child_agent: dict[str, str]
 
     async def _tool_spawn_agent(self, run: ToolRun, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:
-        """Create child worker agent and optionally wait for child completion."""
+        """Create child worker agent and return child/tool run identifiers."""
         try:
             self._enforce_spawn_capacity(agent)
         except ValueError as exc:
@@ -25,9 +25,6 @@ class AgentToolMixin:
         self._register_spawned_child(parent=agent, child=child, run=run)
         self._log_event(agent, "agent_spawned", {"child_agent_id": child.id, "instruction": instruction})
         self._launch_agent(child.id)
-
-        if run.blocking:
-            return await self._blocking_spawn_result(run=run, child=child)
         return self._spawn_running_result(run=run, child=child)
 
     async def _tool_steer_agent(self, run: ToolRun, action: dict[str, Any]) -> dict[str, Any]:
@@ -39,13 +36,19 @@ class AgentToolMixin:
         if target_id not in self.agents:
             raise ValueError(f"unknown agent_id: {target_id}")
         self.pending_steers.setdefault(target_id, []).append(content)
-        result = {"status": "queued", "agent_id": target_id}
+        result = {
+            "steer_agent_status": True,
+            "target_agent_id": target_id,
+            "status": "waiting",
+            "steer_run_id": self._new_id("steerrun"),
+        }
         self._complete_tool_run(run, result=result)
         return result
 
     async def _tool_cancel_agent(self, run: ToolRun, action: dict[str, Any]) -> dict[str, Any]:
         """Cancel target agent subtree recursively."""
         target_id = str(action.get("agent_id", "")).strip()
+        recursive = bool(action.get("recursive", True))
         if not target_id:
             raise ValueError("cancel_agent requires agent_id")
         if target_id not in self.agents:
@@ -53,15 +56,13 @@ class AgentToolMixin:
         root_id = self.session.root_agent_id if self.session is not None else ""
         if target_id == root_id:
             result = {
-                "cancelled_agent_ids": [],
-                "blocked": True,
-                "agent_id": target_id,
-                "reason": "root_agent_not_cancellable",
+                "cancel_agent_status": False,
+                "error": "cancel_agent cannot target the current root agent.",
             }
             self._complete_tool_run(run, result=result)
             return result
-        cancelled = self._cancel_agent_tree(target_id, reason="cancel_agent_tool")
-        result = {"cancelled_agent_ids": cancelled}
+        cancelled = self._cancel_agent_tree(target_id, reason="cancel_agent_tool", recursive=recursive)
+        result = {"cancel_agent_status": bool(cancelled)}
         self._complete_tool_run(run, result=result)
         return result
 
@@ -84,10 +85,8 @@ class AgentToolMixin:
             "status": "rejected",
             "child_agent_id": None,
             "tool_run_id": run.id,
-            "error": {
-                "code": code,
-                "message": message,
-            },
+            "error": message,
+            "error_code": code,
             "capacity": {
                 "active_agents": self._active_agent_count(),
                 "max_active_agents": int(self.config.runtime.limits.max_active_agents),
@@ -100,8 +99,8 @@ class AgentToolMixin:
             "spawn_rejected",
             {
                 "tool_run_id": run.id,
-                "reason": dict(result["error"]),
-                "capacity": dict(result["capacity"]),
+                "reason": {"code": code, "message": message},
+                "capacity": result["capacity"],
             },
         )
         # Keep direct handler calls deterministic; _execute_tool_action will skip re-completion.
@@ -156,23 +155,15 @@ class AgentToolMixin:
         self.agents[child.id] = child
         parent.children.append(child.id)
         self.spawn_run_by_child_agent[child.id] = run.id
-
-    async def _blocking_spawn_result(self, *, run: ToolRun, child: AgentNode) -> dict[str, Any]:
-        """Wait for child completion and expose the resolved terminal state inline."""
-        wait_result = await self._wait_for_tool_run(run.id, timeout_seconds=None)
-        wait_status = str(wait_result.get("status", "")).strip().lower() or "unknown"
-        return {
-            "status": wait_status,
+        run.arguments = {
+            **dict(run.arguments),
             "child_agent_id": child.id,
-            "tool_run_id": run.id,
-            "wait_result": wait_result,
         }
 
     @staticmethod
     def _spawn_running_result(*, run: ToolRun, child: AgentNode) -> dict[str, Any]:
-        """Return the standard non-blocking spawn payload."""
+        """Return OpenCompany-style spawn payload."""
         return {
-            "status": "running",
             "child_agent_id": child.id,
             "tool_run_id": run.id,
         }

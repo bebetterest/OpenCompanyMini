@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from opm_train.llm import ChatResult
 from opm_train.config import OPMTrainConfig
 from opm_train.context import (
     ContextAssembler,
@@ -11,6 +15,12 @@ from opm_train.context import (
 )
 from opm_train.models import AgentNode, AgentRole
 from opm_train.prompts import PromptLibrary, default_prompts_dir
+
+
+class CompressionLLM:
+    async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        del kwargs
+        return ChatResult(content="- summary", raw_events=[])
 
 
 def test_projection_uses_summary_and_tail() -> None:
@@ -28,7 +38,8 @@ def test_projection_uses_summary_and_tail() -> None:
     assert projection.tail_message_indices == (4, 5)
 
 
-def test_compress_context_updates_metadata() -> None:
+@pytest.mark.asyncio
+async def test_compress_context_updates_metadata() -> None:
     agent = AgentNode(
         id="a",
         session_id="s",
@@ -44,7 +55,16 @@ def test_compress_context_updates_metadata() -> None:
         ],
         metadata={"keep_pinned_messages": 1},
     )
-    result = compress_context(agent=agent, reason="manual")
+    config = OPMTrainConfig()
+    config.runtime.context.compression_model = "test-compression-model"
+    library = PromptLibrary(default_prompts_dir())
+    result = await compress_context(
+        agent=agent,
+        reason="manual",
+        config=config,
+        prompt_library=library,
+        llm_client=CompressionLLM(),
+    )
     assert result["compressed"] is True
     assert "context_summary" in agent.metadata
 

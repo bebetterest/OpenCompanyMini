@@ -14,17 +14,20 @@ PROVIDER_PROFILE_NAMES: tuple[str, ...] = ("openrouter", "tinker", "custom")
 
 _DEFAULT_RUNTIME_TOOL_NAMES = (
     "shell",
-    "spawn_agent",
-    "steer_agent",
-    "cancel_agent",
+    "compress_context",
+    "wait_time",
+    "list_mcp_servers",
+    "list_mcp_resources",
+    "read_mcp_resource",
     "list_agent_runs",
     "get_agent_run",
+    "spawn_agent",
+    "cancel_agent",
+    "steer_agent",
     "list_tool_runs",
     "get_tool_run",
     "wait_run",
     "cancel_tool_run",
-    "wait_time",
-    "compress_context",
     "finish",
 )
 
@@ -154,6 +157,7 @@ class RuntimeContextConfig:
     auto_compress_ratio: float = 0.8
     keep_pinned_messages: int = 1
     max_context_tokens: int = 96_000
+    compression_model: str = ""
 
 
 @dataclass(slots=True)
@@ -164,9 +168,11 @@ class RuntimeToolsConfig:
     worker_tools: list[str] = field(default_factory=_default_runtime_tool_names)
     list_default_limit: int = 20
     list_max_limit: int = 200
-    shell_timeout_seconds: float = 60.0
-    wait_run_timeout_seconds: float = 0.0
-    shell_inline_wait_seconds: float = 8.0
+    shell_timeout_seconds: float = 300.0
+    wait_run_timeout_seconds: float = 20.0
+    shell_inline_wait_seconds: float = 5.0
+    wait_time_min_seconds: float = 10.0
+    wait_time_max_seconds: float = 60.0
 
     def tool_names_for_role(self, role: str) -> list[str]:
         """Return enabled tool names for role."""
@@ -184,6 +190,12 @@ class RuntimeToolsConfig:
             except (TypeError, ValueError):
                 parsed = int(self.list_default_limit)
         return max(1, min(int(self.list_max_limit), parsed))
+
+    def wait_time_bounds(self) -> tuple[float, float]:
+        """Return normalized [min,max] bounds for wait_time seconds."""
+        minimum = max(0.0, float(self.wait_time_min_seconds))
+        maximum = max(minimum, float(self.wait_time_max_seconds))
+        return minimum, maximum
 
 
 @dataclass(slots=True)
@@ -288,6 +300,7 @@ class OPMTrainConfig:
             auto_compress_ratio=_as_float(payload.get("auto_compress_ratio"), current.auto_compress_ratio, minimum=0.1, maximum=1.0),
             keep_pinned_messages=_as_int(payload.get("keep_pinned_messages"), current.keep_pinned_messages, minimum=0),
             max_context_tokens=_as_int(payload.get("max_context_tokens"), current.max_context_tokens, minimum=1),
+            compression_model=str(payload.get("compression_model", current.compression_model)).strip(),
         )
 
     def _merge_runtime_tools(self, payload: dict[str, Any]) -> None:
@@ -295,6 +308,18 @@ class OPMTrainConfig:
         if not payload:
             return
         current = self.runtime.tools
+        wait_time_min_seconds = _as_float(
+            payload.get("wait_time_min_seconds"),
+            current.wait_time_min_seconds,
+            minimum=0.0,
+        )
+        wait_time_max_seconds = _as_float(
+            payload.get("wait_time_max_seconds"),
+            current.wait_time_max_seconds,
+            minimum=0.0,
+        )
+        if wait_time_max_seconds < wait_time_min_seconds:
+            wait_time_max_seconds = wait_time_min_seconds
         self.runtime.tools = RuntimeToolsConfig(
             root_tools=_as_str_list(payload.get("root_tools"), current.root_tools),
             worker_tools=_as_str_list(payload.get("worker_tools"), current.worker_tools),
@@ -315,6 +340,8 @@ class OPMTrainConfig:
                 current.shell_inline_wait_seconds,
                 minimum=0.0,
             ),
+            wait_time_min_seconds=wait_time_min_seconds,
+            wait_time_max_seconds=wait_time_max_seconds,
         )
 
     def _merge_extensions(self, payload: dict[str, Any]) -> None:

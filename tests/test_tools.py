@@ -34,27 +34,74 @@ def test_tool_definitions_list_limit_uses_runtime_config() -> None:
     config.runtime.tools.list_max_limit = 81
     library = PromptLibrary(default_prompts_dir())
     tools = tool_definitions_for_role(AgentRole.WORKER, prompt_library=library, config=config)
-    list_tool = _tool_by_name(tools, "list_tool_runs")
-    limit_schema = list_tool["function"]["parameters"]["properties"]["limit"]  # type: ignore[index]
-    assert limit_schema["default"] == 37
-    assert limit_schema["maximum"] == 81
+    for name in ("list_agent_runs", "list_tool_runs", "list_mcp_resources"):
+        tool = _tool_by_name(tools, name)
+        limit_schema = tool["function"]["parameters"]["properties"]["limit"]  # type: ignore[index]
+        assert limit_schema["default"] == 37
+        assert limit_schema["maximum"] == 81
+        assert limit_schema["minimum"] == 1
 
 
-def test_tool_definitions_timeout_defaults_use_runtime_config() -> None:
+def test_tool_definitions_shell_schema_matches_opencompany_contract() -> None:
     config = OPMTrainConfig()
-    config.runtime.tools.shell_timeout_seconds = 91
-    config.runtime.tools.wait_run_timeout_seconds = 2.5
     library = PromptLibrary(default_prompts_dir())
     tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
-    shell_tool = _tool_by_name(tools, "shell")
-    shell_timeout = shell_tool["function"]["parameters"]["properties"]["timeout_seconds"]  # type: ignore[index]
-    assert shell_timeout["default"] == 91.0
-    assert shell_timeout["minimum"] == 1.0
+    shell = _tool_by_name(tools, "shell")
+    properties = shell["function"]["parameters"]["properties"]  # type: ignore[index]
+    assert "command" in properties
+    assert "cwd" in properties
+    assert "blocking" not in properties
+    assert "timeout_seconds" not in properties
 
-    wait_tool = _tool_by_name(tools, "wait_run")
-    wait_timeout = wait_tool["function"]["parameters"]["properties"]["timeout_seconds"]  # type: ignore[index]
-    assert wait_timeout["default"] == 2.5
-    assert wait_timeout["minimum"] == 0.0
+
+def test_tool_definitions_wait_time_bounds_follow_runtime_config() -> None:
+    config = OPMTrainConfig()
+    config.runtime.tools.wait_time_min_seconds = 12
+    config.runtime.tools.wait_time_max_seconds = 48
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
+    wait_time = _tool_by_name(tools, "wait_time")
+    seconds_schema = wait_time["function"]["parameters"]["properties"]["seconds"]  # type: ignore[index]
+    assert seconds_schema["minimum"] == 12
+    assert seconds_schema["maximum"] == 48
+
+
+def test_tool_definitions_get_agent_and_tool_run_extended_fields() -> None:
+    config = OPMTrainConfig()
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
+
+    get_agent = _tool_by_name(tools, "get_agent_run")
+    agent_props = get_agent["function"]["parameters"]["properties"]  # type: ignore[index]
+    assert "messages_start" in agent_props
+    assert "messages_end" in agent_props
+
+    get_tool = _tool_by_name(tools, "get_tool_run")
+    tool_props = get_tool["function"]["parameters"]["properties"]  # type: ignore[index]
+    assert "include_result" in tool_props
+
+
+def test_tool_definitions_cancel_agent_has_recursive_flag() -> None:
+    config = OPMTrainConfig()
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
+    cancel_agent = _tool_by_name(tools, "cancel_agent")
+    properties = cancel_agent["function"]["parameters"]["properties"]  # type: ignore[index]
+    assert "recursive" in properties
+
+
+def test_tool_definitions_disallow_additional_properties() -> None:
+    config = OPMTrainConfig()
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
+    for tool in tools:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        params = function.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        assert params.get("additionalProperties") is False
 
 
 def test_validate_finish_action_worker_requires_next_recommendation_on_failed() -> None:

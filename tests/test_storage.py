@@ -38,9 +38,44 @@ def test_validate_snapshot_tail_rejects_count_mismatch() -> None:
         assert storage.validate_snapshot_tail("s-3", expected_last_event_seq=3) is False
 
 
+def test_load_events_keeps_unicode_line_separator_inside_json_string() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        session_id = "s-unicode-events"
+        storage.append_event(
+            session_id,
+            {
+                "seq": 1,
+                "event_type": "unicode",
+                "message": "Line A\u2028Line B",
+            },
+        )
+        loaded = storage.load_events(session_id)
+        assert len(loaded) == 1
+        assert loaded[0]["message"] == "Line A\u2028Line B"
+
+
+def test_load_turns_keeps_unicode_line_separator_inside_json_string() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        session_id = "s-unicode-turns"
+        storage.append_turn(
+            session_id,
+            {
+                "turn_id": "turn-1",
+                "agent_id": "agent-1",
+                "step": 1,
+                "summary": "Line A\u2028Line B",
+            },
+        )
+        loaded = storage.load_turns(session_id)
+        assert len(loaded) == 1
+        assert loaded[0]["summary"] == "Line A\u2028Line B"
+
+
 def test_tool_run_roundtrip_without_parent_run_id() -> None:
     run = ToolRun(
-        id="tool-1",
+        id="toolrun-1",
         session_id="session-1",
         agent_id="agent-1",
         tool_name="shell",
@@ -59,7 +94,7 @@ def test_tool_run_roundtrip_without_parent_run_id() -> None:
 
 def test_tool_run_roundtrip_supports_abandoned_status() -> None:
     run = ToolRun(
-        id="tool-2",
+        id="toolrun-2",
         session_id="session-1",
         agent_id="agent-1",
         tool_name="shell",

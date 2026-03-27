@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -144,20 +145,31 @@ def estimate_conversation_tokens(agent: AgentNode) -> int:
 
 
 def maybe_auto_compress(*, agent: AgentNode, config: OPMTrainConfig) -> bool:
-    """Auto-trigger context compression when usage ratio crosses threshold."""
+    """Return whether auto-compress should trigger at current context usage."""
     if not config.runtime.context.enabled:
         return False
     limit = max(1, int(config.runtime.context.max_context_tokens))
     usage_ratio = estimate_conversation_tokens(agent) / limit
-    if usage_ratio < float(config.runtime.context.auto_compress_ratio):
-        return False
-    compress_context(agent=agent, reason="auto_threshold")
-    return True
+    return usage_ratio >= float(config.runtime.context.auto_compress_ratio)
 
 
-def compress_context(*, agent: AgentNode, reason: str) -> dict[str, Any]:
-    """Summarize older middle turns and store summary metadata."""
+async def compress_context(
+    *,
+    agent: AgentNode,
+    reason: str,
+    config: OPMTrainConfig,
+    prompt_library: PromptLibrary,
+    llm_client: Any | None,
+) -> dict[str, Any]:
+    """Compress older middle turns via dedicated LLM compression model."""
     metadata = _metadata(agent)
+    if llm_client is None:
+        return {"compressed": False, "error": "llm_client is required for context compression."}
+    compression_model = str(config.runtime.context.compression_model).strip()
+    if not compression_model:
+        compression_model = str(config.provider.active_profile().model).strip()
+    if not compression_model:
+        return {"compressed": False, "error": "runtime.context.compression_model is required."}
     conversation = list(agent.conversation)
     if len(conversation) <= 2:
         return {"compressed": False, "reason": "conversation_too_short"}
@@ -170,22 +182,57 @@ def compress_context(*, agent: AgentNode, reason: str) -> dict[str, Any]:
         return {"compressed": False, "reason": "no_compressible_window"}
 
     window = conversation[start : end + 1]
-    summary = _summarize_messages(window)
+    previous_summary = str(metadata.get("context_summary", "")).strip()
+    system_prompt = (
+        prompt_library.render_runtime_message("context_compression_system_prompt")
+        if "context_compression_system_prompt" in prompt_library.load_runtime_messages()
+        else (
+            "Summarize conversation history for future continuation. Keep factual "
+            "decisions, pending tasks, blockers, and next steps in concise English bullets."
+        )
+    )
+    request_payload = {
+        "reason": reason,
+        "previous_summary": previous_summary,
+        "messages": [
+            {
+                "index": start + index,
+                "role": str(message.get("role", "unknown")).strip() or "unknown",
+                "content": str(message.get("content", "")),
+            }
+            for index, message in enumerate(window)
+        ],
+    }
+    request_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(request_payload, ensure_ascii=False)},
+    ]
+    result = await llm_client.stream_chat(
+        model=compression_model,
+        messages=request_messages,
+        temperature=0.0,
+        max_tokens=max(256, int(config.provider.active_profile().max_tokens)),
+        tools=None,
+        tool_choice=None,
+        parallel_tool_calls=None,
+    )
+    summary = str(getattr(result, "content", "")).strip()
+    if not summary:
+        return {"compressed": False, "error": "compression model returned empty summary."}
     summary_version = int(metadata.get("summary_version", 0) or 0) + 1
     metadata["context_summary"] = summary
     metadata["summary_version"] = summary_version
     metadata["summarized_until_message_index"] = end
     metadata["last_compression_reason"] = reason
+    metadata["compression_model"] = compression_model
     return {
         "compressed": True,
+        "reason": reason,
+        "model": compression_model,
         "summary_version": summary_version,
         "summarized_until_message_index": end,
+        "message_range": {"start": start, "end": end},
     }
-
-
-def _summarize_messages(messages: list[dict[str, Any]]) -> str:
-    """Create compact bullet summary from latest window messages."""
-    return "\n".join(_summary_line(item) for item in messages[-8:])
 
 
 def _select_messages(
@@ -196,15 +243,6 @@ def _select_messages(
     """Select valid messages from conversation by index sequence."""
     size = len(conversation)
     return [conversation[index] for index in indices if 0 <= index < size]
-
-
-def _summary_line(message: dict[str, Any]) -> str:
-    """Build one compact summary bullet from a conversation message."""
-    role = str(message.get("role", "unknown")).strip() or "unknown"
-    content = " ".join(str(message.get("content", "")).split())
-    if len(content) > 140:
-        content = content[:137] + "..."
-    return f"- {role}: {content}"
 
 
 def _to_non_negative_int(value: Any) -> int | None:

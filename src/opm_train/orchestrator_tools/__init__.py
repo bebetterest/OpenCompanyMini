@@ -38,7 +38,7 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
     def _create_tool_run(self, *, agent: AgentNode, tool_name: str, arguments: dict[str, Any], blocking: bool) -> ToolRun:
         """Create tool-run record and initialize waiter bookkeeping."""
         run = ToolRun(
-            id=self._new_id("tool"),
+            id=self._new_id("toolrun"),
             session_id=agent.session_id,
             agent_id=agent.id,
             tool_name=tool_name,
@@ -99,11 +99,11 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
         event = self.tool_run_events.setdefault(run.id, asyncio.Event())
         event.set()
 
-    def _resolve_action_blocking(self, *, action_type: str, action: dict[str, Any]) -> bool:
-        """Resolve action blocking mode from registry defaults plus action override."""
+    def _resolve_action_blocking(self, *, action_type: str) -> bool:
+        """Resolve action blocking mode from registry defaults."""
         spec = TOOL_REGISTRY.get(action_type)
         default = spec.default_blocking if spec is not None else True
-        return _as_bool(action.get("blocking"), default=default)
+        return bool(default)
 
     def _reject_tool_action(
         self,
@@ -125,6 +125,7 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
         self._fail_tool_run(run, error=error_message)
         exc = ValueError(error_message)
         result = self._tool_error_result(
+            agent=agent,
             run=run,
             action=action,
             exc=exc,
@@ -155,6 +156,7 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
     def _tool_error_result(
         self,
         *,
+        agent: AgentNode,
         run: ToolRun,
         action: dict[str, Any],
         exc: BaseException,
@@ -164,22 +166,16 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
         message = str(exc).strip() or "<empty>"
         code = error_code or _infer_tool_error_code(tool_name=run.tool_name, message=message)
         return {
-            "ok": False,
-            "tool_name": run.tool_name,
-            "tool_run_id": run.id,
-            "tool_run_status": run.status.value,
-            "error": {
-                "code": code,
-                "type": type(exc).__name__,
-                "message": message,
-            },
+            "error": message,
+            "error_code": code,
             "action": json_ready(action),
+            "available_tools": list(self.config.runtime.tools.tool_names_for_role(agent.role.value)),
         }
 
     async def _execute_tool_action(self, *, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:
         """Execute one non-finish action and persist tool-run lifecycle."""
         action_type = str(action.get("type", "")).strip()
-        blocking = self._resolve_action_blocking(action_type=action_type, action=action)
+        blocking = self._resolve_action_blocking(action_type=action_type)
         run = self._create_tool_run(agent=agent, tool_name=action_type, arguments=action, blocking=blocking)
         self._mark_tool_run_running(run)
         try:
@@ -195,13 +191,23 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
                     action=action,
                 )
             if run.status == ToolRunStatus.RUNNING and action_type not in SELF_COMPLETING_TOOL_ACTIONS:
-                self._complete_tool_run(run, result=result)
+                error_text = str(result.get("error", "")).strip() if isinstance(result, dict) else ""
+                if error_text:
+                    self._fail_tool_run(run, error=error_text)
+                else:
+                    self._complete_tool_run(run, result=result)
             self._log_event(agent, "tool_call", {"action": json_ready(action), "result": json_ready(result), "tool_run_id": run.id})
             return result
         except Exception as exc:
-            if run.status not in {ToolRunStatus.CANCELLED, ToolRunStatus.COMPLETED, ToolRunStatus.FAILED}:
+            if run.status not in {
+                ToolRunStatus.CANCELLED,
+                ToolRunStatus.COMPLETED,
+                ToolRunStatus.FAILED,
+                ToolRunStatus.ABANDONED,
+            }:
                 self._fail_tool_run(run, error=str(exc))
             result = self._tool_error_result(
+                agent=agent,
                 run=run,
                 action=action,
                 exc=exc,
@@ -229,23 +235,6 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
         finally:
             self._persist_snapshot()
 
-
-def _as_bool(value: Any, *, default: bool) -> bool:
-    """Parse permissive boolean-like values with fallback default."""
-    if value is None:
-        return bool(default)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in {"true", "1", "yes", "y", "on"}:
-        return True
-    if text in {"false", "0", "no", "n", "off", ""}:
-        return False
-    return bool(value)
-
-
 def _infer_tool_error_code(*, tool_name: str, message: str) -> str:
     """Map common tool failure messages to stable machine-readable error codes."""
     text = str(message).strip().lower()
@@ -262,8 +251,10 @@ def _infer_tool_error_code(*, tool_name: str, message: str) -> str:
         return "unknown_tool_run_id"
     if "requires agent_id" in text:
         return "missing_agent_id"
-    if "requires run_id" in text:
-        return "missing_run_id"
+    if "requires tool_run_id" in text:
+        return "missing_tool_run_id"
+    if "requires exactly one of 'tool_run_id' or 'agent_id'" in text:
+        return "invalid_wait_run_target"
     if "requires non-empty command" in text:
         return "missing_command"
     if name == "shell" and "timed out" in text:

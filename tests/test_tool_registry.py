@@ -16,6 +16,9 @@ def test_tool_registry_contains_canonical_runtime_tools() -> None:
         "wait_run",
         "cancel_tool_run",
         "wait_time",
+        "list_mcp_servers",
+        "list_mcp_resources",
+        "read_mcp_resource",
         "compress_context",
     }
     assert set(TOOL_REGISTRY.keys()) == expected

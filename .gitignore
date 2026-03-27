@@ -1,5 +1,6 @@
 # Reference implementation (explicitly kept out of this repo's scope)
 OpenCompany/
+tmp/
 
 # Python bytecode/cache
 __pycache__/
