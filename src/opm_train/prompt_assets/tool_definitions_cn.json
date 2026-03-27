@@ -9,7 +9,7 @@
         "properties": {
           "command": {"type": "string", "description": "要执行的命令。"},
           "cwd": {"type": "string", "description": "工作区相对目录。", "default": "."},
-          "timeout_seconds": {"type": "number", "description": "超时秒数。", "minimum": 1, "maximum": 600},
+          "timeout_seconds": {"type": "number", "description": "超时秒数。", "minimum": 1, "maximum": 600, "default": 60},
           "blocking": {"type": "boolean", "description": "是否等待执行完成。", "default": true}
         },
         "required": ["command"]
@@ -128,7 +128,7 @@
         "type": "object",
         "properties": {
           "run_id": {"type": "string", "description": "工具运行 ID。"},
-          "timeout_seconds": {"type": "number", "description": "可选超时秒数。"}
+          "timeout_seconds": {"type": "number", "description": "等待超时秒数；0 表示不设超时。", "minimum": 0, "default": 0}
         },
         "required": ["run_id"]
       }

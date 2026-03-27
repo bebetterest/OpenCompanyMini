@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import runpy
+import shutil
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from opm_train.cli import main
 from opm_train.models import RunSession, SessionStatus
 from opm_train.sft.contracts import SFTBackendResult
 from opm_train.sft.runner import SFTRunOutput
+from opm_train.storage import SessionStorage
 
 APP_DIR = Path(__file__).resolve().parents[1]
 
@@ -536,3 +538,170 @@ def test_sft_command_outputs_structured_payload(capsys, monkeypatch) -> None:
         assert payload["total_examples"] == 1
         assert payload["steps"] == 2
         assert payload["checkpoint_path"] == "tinker://demo/checkpoint"
+
+
+def test_export_command_writes_raw_and_sft_outputs(capsys) -> None:
+    with TemporaryDirectory() as temp_dir:
+        workspace = Path(temp_dir)
+        app_dir = workspace / "app"
+        project_dir = workspace / "project"
+        project_dir.mkdir(parents=True)
+        shutil.copytree(APP_DIR / "prompts", app_dir / "prompts")
+        shutil.copy2(APP_DIR / "opm_train.toml", app_dir / "opm_train.toml")
+
+        rc = main(
+            [
+                "smoke",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(project_dir),
+                "--task",
+                "export-smoke",
+            ]
+        )
+        assert rc == 0
+        smoke_payload = json.loads(capsys.readouterr().out.strip())
+        session_id = smoke_payload["session_id"]
+
+        raw_output = workspace / "raw.json"
+        rc = main(
+            [
+                "export",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(project_dir),
+                "--session-id",
+                session_id,
+                "--mode",
+                "raw",
+                "--output",
+                str(raw_output),
+            ]
+        )
+        assert rc == 0
+        raw_meta = json.loads(capsys.readouterr().out.strip())
+        assert raw_meta["count"] >= 1
+        raw_payload = json.loads(raw_output.read_text(encoding="utf-8"))
+        assert raw_payload["session_id"] == session_id
+        assert len(raw_payload["turns"]) >= 1
+        root_agent_id = str(raw_payload["session"]["root_agent_id"])
+
+        scoped_output = workspace / "scoped.json"
+        rc = main(
+            [
+                "export",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(project_dir),
+                "--session-id",
+                session_id,
+                "--agent-id",
+                root_agent_id,
+                "--step",
+                "1",
+                "--mode",
+                "raw",
+                "--output",
+                str(scoped_output),
+            ]
+        )
+        assert rc == 0
+        scoped_meta = json.loads(capsys.readouterr().out.strip())
+        assert scoped_meta["count"] == 1
+        scoped_payload = json.loads(scoped_output.read_text(encoding="utf-8"))
+        assert len(scoped_payload["turns"]) == 1
+        assert int(scoped_payload["turns"][0]["step"]) == 1
+
+        sft_output = workspace / "sft.jsonl"
+        rc = main(
+            [
+                "export",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(project_dir),
+                "--session-id",
+                session_id,
+                "--mode",
+                "sft",
+                "--output",
+                str(sft_output),
+            ]
+        )
+        assert rc == 0
+        sft_meta = json.loads(capsys.readouterr().out.strip())
+        assert sft_meta["count"] >= 1
+        rows = [json.loads(line) for line in sft_output.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert rows
+        target = rows[0]["target"]
+        assert target["role"] == "assistant"
+
+
+def test_export_command_rejects_old_snapshot_schema() -> None:
+    with TemporaryDirectory() as temp_dir:
+        workspace = Path(temp_dir)
+        app_dir = workspace / "app"
+        project_dir = workspace / "project"
+        project_dir.mkdir(parents=True)
+        shutil.copytree(APP_DIR / "prompts", app_dir / "prompts")
+        shutil.copy2(APP_DIR / "opm_train.toml", app_dir / "opm_train.toml")
+
+        storage = SessionStorage(app_dir=app_dir, data_dir_name=".opm_train")
+        session_id = "session-old-schema"
+        storage.snapshot_path(session_id).write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "last_event_seq": 0,
+                    "session": {},
+                    "agents": {},
+                    "tool_runs": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="schema_version >= 4"):
+            main(
+                [
+                    "export",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(project_dir),
+                    "--session-id",
+                    session_id,
+                    "--mode",
+                    "raw",
+                ]
+            )
+
+
+def test_export_command_rejects_step_without_agent_id() -> None:
+    with TemporaryDirectory() as temp_dir:
+        workspace = Path(temp_dir)
+        app_dir = workspace / "app"
+        project_dir = workspace / "project"
+        project_dir.mkdir(parents=True)
+        shutil.copytree(APP_DIR / "prompts", app_dir / "prompts")
+        shutil.copy2(APP_DIR / "opm_train.toml", app_dir / "opm_train.toml")
+
+        with pytest.raises(ValueError, match="--step requires --agent-id"):
+            main(
+                [
+                    "export",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(project_dir),
+                    "--session-id",
+                    "session-any",
+                    "--step",
+                    "1",
+                    "--mode",
+                    "raw",
+                ]
+            )

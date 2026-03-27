@@ -76,6 +76,7 @@ class RuntimeOrchestrator(
         self.tool_run_events: dict[str, asyncio.Event] = {}
         self.spawn_run_by_child_agent: dict[str, str] = {}
         self.pending_steers: dict[str, list[str]] = {}
+        self.active_turns: dict[str, dict[str, Any]] = {}
         self.event_seq = 0
         self._agent_created_index = 0
 
@@ -129,7 +130,7 @@ class RuntimeOrchestrator(
             return
         with self._timer_scope("persist_snapshot"):
             snapshot = SnapshotState(
-                schema_version=3,
+                schema_version=4,
                 last_event_seq=self.event_seq,
                 session=session_to_dict(self.session),
                 agents={agent_id: agent_to_dict(agent) for agent_id, agent in self.agents.items()},
@@ -144,6 +145,7 @@ class RuntimeOrchestrator(
         self.tool_run_events = {}
         self.spawn_run_by_child_agent = {}
         self.pending_steers = {}
+        self.active_turns = {}
 
     @staticmethod
     def _new_id(prefix: str) -> str:

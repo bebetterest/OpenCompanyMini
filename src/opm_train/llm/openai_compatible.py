@@ -233,9 +233,12 @@ def _merge_tool_call_delta(parts: dict[int, dict[str, str]], raw_call: Any) -> N
     if not isinstance(raw_call, dict):
         return
     index = int(raw_call.get("index", 0) or 0)
-    current = parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
+    current = parts.setdefault(index, {"id": "", "type": "function", "name": "", "arguments": ""})
     if raw_call.get("id"):
         current["id"] = str(raw_call["id"])
+    call_type = str(raw_call.get("type", "")).strip()
+    if call_type:
+        current["type"] = call_type
     function = raw_call.get("function")
     if not isinstance(function, dict):
         return
@@ -247,14 +250,19 @@ def _merge_tool_call_delta(parts: dict[int, dict[str, str]], raw_call: Any) -> N
 
 def _tool_calls_payload(parts: dict[int, dict[str, str]]) -> list[dict[str, Any]]:
     """Convert accumulated call fragments into normalized call payloads."""
-    return [
-        {
-            "id": value["id"] or f"tool-call-{index}",
-            "name": value["name"],
-            "arguments_json": value["arguments"] or "{}",
-        }
-        for index, value in sorted(parts.items())
-    ]
+    payloads: list[dict[str, Any]] = []
+    for index, value in sorted(parts.items()):
+        arguments_json = value["arguments"] or "{}"
+        name = value["name"]
+        call_type = str(value.get("type", "")).strip() or "function"
+        payloads.append(
+            {
+                "id": value["id"] or f"tool-call-{index}",
+                "type": call_type,
+                "function": {"name": name, "arguments": arguments_json},
+            }
+        )
+    return payloads
 
 
 async def _maybe_await(value: Any) -> None:

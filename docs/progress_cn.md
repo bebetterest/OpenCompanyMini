@@ -1,5 +1,25 @@
 # 进度
 
+## 2026-03-25
+
+- 调整 `spawn_agent` 容量上限行为（`max_active_agents` / `max_children_per_agent`）：运行时不再以工具执行异常直接抛错，而是向调用方 agent 返回结构化 `status: rejected` 结果；对应 spawn tool run 记为 `completed` 并带拒绝细节。
+- 增加容量受限 spawn 的回归测试，确保不会创建子代理，且拒绝信息可通过 tool 结果稳定观测。
+
+## 2026-03-24
+
+- 修复 OpenAI 兼容 tool-call 重放结构：assistant `tool_calls` 现会在跨轮保留必需的 `type/function` 字段，避免 `messages[*].tool_calls[*].type` 缺失导致的 provider 400。
+- 收紧 tool-call 协议为仅 OpenAI 兼容格式（`type=function`、`function.name`、`function.arguments`）；不再接受旧格式 `name/arguments_json`。
+- 更新每个 agent 产物目录命名为在前缀和 id 后缀之间加入 name slug（例如 `agent-tester-08277a53f952`），不兼容旧目录名。
+- 增加对应回归测试：覆盖 assistant tool-call 重放结构与协议解析兼容性。
+- 新增按 step 落盘的轮次索引 `.opm_train/sessions/<session_id>/turns.jsonl`，固定字段覆盖 `turn_id`、step 范围、协议尝试引用、动作/结果、finish 负载与 step 错误。
+- 新增 step 级运行时事件：`agent_step_started`、`agent_step_finished`、`llm_call_request_recorded`、`llm_call_response_recorded`。
+- 快照写入版本升级为 `schema_version = 4`。
+- 新增模块化轨迹导出子系统 `src/opm_train/trajectory`（`loader`、`filter`、`formatter`），支持 session/agent/agent-step 作用域导出。
+- CLI 新增 `opm-train export --session-id ... --mode raw|sft`，支持可选 `--agent-id` 与 `--step`。
+- 新增导出版本门禁：快照 schema `< 4` 的旧会话会被拒绝导出。
+- 增加回归测试：turns 存储与过滤、运行时 turn 索引落盘、轨迹 raw/sft 导出、CLI 导出链路与旧 schema 拒绝。
+- 同步更新 README/README_cn：补充 export 用法、turns 索引说明与 schema v4 说明。
+
 ## 2026-03-21
 
 - 在 `pyproject.toml` 增加 `sft` 可选依赖组（`tinker`），并将环境安装更新为 `.[dev,sft]`。
@@ -41,7 +61,8 @@
 - 增加对应测试，覆盖产物落盘、UTF-8/中文记录、计时输出与错误日志可见性。
 - 将 telemetry 相关方法从 `RuntimeOrchestrator` 抽离到 `OrchestratorTelemetryMixin`，模块边界更清晰。
 - 在 `SessionStorage` 中为 agent 产物顺序号增加惰性缓存，减少重复目录扫描开销。
-- `cancel_agent` 对未知 `agent_id` 改为抛出显式 `ValueError`，不再静默 no-op。
+- 工具/动作执行错误（含未知 `agent_id`）改为返回结构化错误结果，并同时记录错误日志与 failed tool run，不再通过异常冒泡导致整个 agent loop 失败。
+- shell 后台执行新增晚到异常兜底：内部子进程启动等异常会被消费并将对应 run 标记为 failed，避免 run 卡在 `running`。
 - `spawn_agent` 在 `blocking=true` 时，顶层 `status` 改为反映子代理终态（`completed` / `failed` / `cancelled`）。
 - `cancel_tool_run` 继续只作用于 tool run 生命周期；取消 `spawn_agent` 的 tool run 不会终止已经运行中的子代理。
 - 将 spawn/list 相关运行时逻辑拆成更小的 helper，后续扩展 agent/tool 编排更容易。

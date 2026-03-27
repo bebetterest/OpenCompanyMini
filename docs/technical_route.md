@@ -14,6 +14,7 @@
 - Supervised fine-tuning module with pluggable backend ports (built-in `tinker`) and JSONL-based run artifacts.
 - Context management with auto-threshold compression + manual `compress_context`.
 - JSONL canonical event logging and snapshot-based resume.
+- Step-level turn indexing (`turns.jsonl`) plus scoped trajectory export (`session` / `agent` / `agent+step`) for training-data extraction.
 - Strict snapshot-to-event-tail validation before resume (continuous sequence + tail consistency).
 - Slimming A removes dormant states/fields while keeping shell inline wait budget (`shell_inline_wait_seconds`) for shell run UX.
 

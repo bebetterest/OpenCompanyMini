@@ -1,5 +1,25 @@
 # Progress
 
+## 2026-03-25
+
+- Changed `spawn_agent` capacity behavior (`max_active_agents` / `max_children_per_agent`): runtime now returns a structured `status: rejected` payload to the caller agent instead of raising a tool execution exception, and records the spawn tool run as `completed` with rejection details.
+- Added regression coverage for capacity-limited spawn behavior to ensure no child agent is created and the rejection remains observable through tool results.
+
+## 2026-03-24
+
+- Fixed OpenAI-compatible tool-call replay shape: assistant `tool_calls` now preserves required `type/function` fields across turns, preventing provider 400 errors like `messages[*].tool_calls[*].type` missing.
+- Tightened tool-call protocol to OpenAI-compatible format only (`type=function`, `function.name`, `function.arguments`); legacy `name/arguments_json` shape is no longer accepted.
+- Updated per-agent artifact folder naming to include agent name slug between prefix and id suffix (for example `agent-tester-08277a53f952`) with no legacy folder-name compatibility.
+- Added regression coverage for replayed assistant tool-call schema and protocol parsing compatibility.
+- Added per-step turn index persistence `.opm_train/sessions/<session_id>/turns.jsonl` with stable fields (`turn_id`, step scope, attempt references, action/results, finish payload, step error).
+- Added step-level runtime telemetry events: `agent_step_started`, `agent_step_finished`, `llm_call_request_recorded`, and `llm_call_response_recorded`.
+- Upgraded snapshot writer schema to `schema_version = 4`.
+- Added modular trajectory export subsystem under `src/opm_train/trajectory` (`loader`, `filter`, `formatter`) for session/agent/agent-step scoped exports.
+- Added CLI subcommand `opm-train export --session-id ... --mode raw|sft` with optional `--agent-id` and `--step`.
+- Added export guard that rejects old sessions with snapshot schema `< 4`.
+- Added regression coverage for turns storage/filtering, turn-index runtime persistence, trajectory raw/sft exports, CLI export happy path, and old-schema rejection.
+- Updated README/README_cn with export usage, turns index description, and schema v4 notes.
+
 ## 2026-03-21
 
 - Added `sft` dependency extra in `pyproject.toml` (`tinker`) and updated environment bootstrap to install `.[dev,sft]`.
@@ -41,7 +61,8 @@
 - Added tests for artifact persistence, UTF-8/Chinese payload recording, timer output, and error-log visibility.
 - Refactored telemetry methods out of `RuntimeOrchestrator` into `OrchestratorTelemetryMixin` for cleaner modular boundaries.
 - Optimized per-agent artifact sequencing with lazy cache in `SessionStorage` to avoid repeated directory scans.
-- `cancel_agent` now rejects unknown `agent_id` with explicit `ValueError` instead of silent no-op.
+- Tool/action execution errors (including unknown `agent_id`) now return structured tool error payloads while still recording error logs and failed tool-run state, instead of bubbling exceptions that fail the whole agent loop.
+- Shell background execution now consumes late task exceptions and marks affected runs as failed (instead of leaving them stuck in `running` on internal subprocess startup errors).
 - Blocking `spawn_agent` now reports child terminal state at top-level `status` (`completed` / `failed` / `cancelled`).
 - `cancel_tool_run` is kept scoped to tool-run lifecycle; cancelling a `spawn_agent` run no longer terminates an already running child agent.
 - Refactored spawn/list runtime helpers to keep agent/tool orchestration paths smaller and easier to extend.

@@ -51,6 +51,7 @@ opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency
 opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
 opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_model> [--steps 6] [--batch-size 8] [--learning-rate 1e-4]
+opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] --mode raw|sft [--output <path>]
 ```
 
 Common options:
@@ -82,23 +83,26 @@ Common options:
 - Removed dormant runtime status/fields: `AgentStatus.waiting`, `ToolRun.parent_run_id`.
 - Removed unused runtime tracker and helper: `tool_run_owner_agent`, `stable_json_dumps`.
 - Kept `runtime.tools.shell_inline_wait_seconds` as shell inline-return threshold.
-- Snapshot schema now writes `schema_version = 3` (no compatibility guarantee for older snapshots in this slimming pass).
+- Snapshot schema now writes `schema_version = 4` (no compatibility guarantee for older snapshots in this slimming pass).
 
 ## Runtime Behavior Updates
 
 - `finish` is rejected (not failed) when the current agent still has non-terminal own tool runs; tool result includes `finish_rejected` and `unfinished_tool_runs`.
 - `resume` marks non-restorable non-terminal tool runs as `abandoned` instead of `failed`.
 - `doctor` now reports tool-contract checks via `tool_contract_ok` and `tool_contract_issues`; `ready_for_real_run` requires tool contract consistency.
+- Tool/action execution errors (for example unknown `agent_id`, missing tool `type`, or disabled tool name) no longer terminate the agent loop by bubbling exceptions; runtime records the error, marks the tool run failed, and returns a structured error payload (`error.code` / `error.type` / `error.message`).
+- `shell` and `wait_run` now read default timeout settings from `runtime.tools.shell_timeout_seconds` and `runtime.tools.wait_run_timeout_seconds` (action-level `timeout_seconds` still overrides); timeout responses now include timeout context (`timed_out`, `timeout_seconds`).
 
 ## Runtime Data
 
 By default, runtime data is written under:
 
 - `.opm_train/sessions/<session_id>/events.jsonl`
+- `.opm_train/sessions/<session_id>/turns.jsonl`
 - `.opm_train/sessions/<session_id>/state_snapshot.json`
-- `.opm_train/sessions/<session_id>/agents/<agent_id>/llm_calls/<index>_request.json`
-- `.opm_train/sessions/<session_id>/agents/<agent_id>/llm_calls/<index>_response.json`
-- `.opm_train/sessions/<session_id>/agents/<agent_id>/context_compressions/<index>.json`
+- `.opm_train/sessions/<session_id>/agents/<agent_folder>/llm_calls/<index>_request.json`
+- `.opm_train/sessions/<session_id>/agents/<agent_folder>/llm_calls/<index>_response.json`
+- `.opm_train/sessions/<session_id>/agents/<agent_folder>/context_compressions/<index>.json`
 - `.opm_train/sessions/<session_id>/logs/runtime.log`
 - `.opm_train/sessions/<session_id>/logs/errors.jsonl`
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl` (when `--timer` is enabled)
@@ -111,8 +115,25 @@ By default, runtime data is written under:
 Each `llm_calls/*_request.json` and `*_response.json` includes canonical inference metadata:
 `inference_provider`, `inference_endpoint`, `inference_model`, and `inference_parameters` (for example `temperature`, `max_tokens`, tool-call switches).
 
+`<agent_folder>` defaults to `agent-<name_slug>-<agent_id_suffix>` (for example `agent-tester-08277a53f952`).
+
 `events.jsonl` is the canonical raw trajectory log for analysis/training.
 Before `resume`, runtime performs strict snapshot/event-tail validation (contiguous `seq` and count match).
+
+`turns.jsonl` is the per-agent step index. Each row captures one step-turn with:
+`turn_id`, `agent_id`, `step`, `event_seq_start/end`, `attempts`, `final_attempt`, `actions`, `action_results`, `finish_payload`, and `step_error`.
+
+`export` supports scoped extraction:
+
+- Session scope: `--session-id <id> --mode raw|sft`
+- Agent scope: `--session-id <id> --agent-id <id> --mode raw|sft`
+- Agent-step scope: `--session-id <id> --agent-id <id> --step <n> --mode raw|sft`
+
+Rules:
+
+- `--step` requires `--agent-id`.
+- `--mode sft` emits OpenAI-messages style rows, using only the final successful protocol attempt per turn.
+- Export requires snapshot `schema_version >= 4` (older sessions are rejected).
 
 ## SFT Workflow
 

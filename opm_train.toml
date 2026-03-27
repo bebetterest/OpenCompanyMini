@@ -52,7 +52,6 @@ max_context_tokens = 96000
 
 [runtime.tools]
 root_tools = [
-  "shell",
   "spawn_agent",
   "steer_agent",
   "cancel_agent",
@@ -67,7 +66,6 @@ root_tools = [
   "finish",
 ]
 worker_tools = [
-  "shell",
   "spawn_agent",
   "steer_agent",
   "cancel_agent",
@@ -83,6 +81,8 @@ worker_tools = [
 ]
 list_default_limit = 20
 list_max_limit = 200
+shell_timeout_seconds = 60
+wait_run_timeout_seconds = 0
 shell_inline_wait_seconds = 8
 
 [extensions]

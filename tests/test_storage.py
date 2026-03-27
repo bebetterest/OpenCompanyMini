@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from opm_train.models import ToolRun, ToolRunStatus
 from opm_train.storage import SessionStorage, tool_run_from_dict, tool_run_to_dict
 
@@ -78,31 +80,36 @@ def test_agent_llm_call_and_context_compression_records_are_sequential_and_utf8(
         storage = _new_storage(Path(temp_dir))
         session_id = "s-cn"
         agent_id = "agent-cn"
+        agent_name = "Agent CN"
 
         seq1 = storage.append_agent_llm_call_request(
             session_id,
             agent_id,
             {"content": "请求：请输出中文。"},
+            agent_name=agent_name,
         )
         storage.append_agent_llm_call_response(
             session_id,
             agent_id,
             seq1,
             {"content": "响应：中文结果。"},
+            agent_name=agent_name,
         )
         seq2 = storage.append_agent_llm_call_request(
             session_id,
             agent_id,
             {"content": "第二次请求"},
+            agent_name=agent_name,
         )
         storage.append_agent_llm_call_response(
             session_id,
             agent_id,
             seq2,
             {"content": "第二次响应"},
+            agent_name=agent_name,
         )
 
-        llm_dir = storage.agent_llm_calls_dir(session_id, agent_id)
+        llm_dir = storage.agent_llm_calls_dir(session_id, agent_id, agent_name=agent_name)
         names = sorted(path.name for path in llm_dir.glob("*.json"))
         assert names == [
             "0001_request.json",
@@ -117,15 +124,17 @@ def test_agent_llm_call_and_context_compression_records_are_sequential_and_utf8(
             session_id,
             agent_id,
             {"reason": "manual", "context_summary": "中文摘要"},
+            agent_name=agent_name,
         )
         c2 = storage.append_agent_context_compression(
             session_id,
             agent_id,
             {"reason": "auto", "context_summary": "第二条摘要"},
+            agent_name=agent_name,
         )
         assert c1 == 1
         assert c2 == 2
-        compression_dir = storage.agent_context_compressions_dir(session_id, agent_id)
+        compression_dir = storage.agent_context_compressions_dir(session_id, agent_id, agent_name=agent_name)
         compression_files = sorted(path.name for path in compression_dir.glob("*.json"))
         assert compression_files == ["0001.json", "0002.json"]
         assert "中文摘要" in (compression_dir / "0001.json").read_text(encoding="utf-8")
@@ -153,12 +162,81 @@ def test_next_sequence_uses_existing_files_then_increments_from_cache() -> None:
         storage = _new_storage(Path(temp_dir))
         session_id = "s-seq"
         agent_id = "agent-1"
-        llm_dir = storage.agent_llm_calls_dir(session_id, agent_id)
+        agent_name = "Agent 1"
+        llm_dir = storage.agent_llm_calls_dir(session_id, agent_id, agent_name=agent_name)
         (llm_dir / "0007_request.json").write_text("{}", encoding="utf-8")
 
-        seq1 = storage.append_agent_llm_call_request(session_id, agent_id, {"a": 1})
-        seq2 = storage.append_agent_llm_call_request(session_id, agent_id, {"a": 2})
+        seq1 = storage.append_agent_llm_call_request(session_id, agent_id, {"a": 1}, agent_name=agent_name)
+        seq2 = storage.append_agent_llm_call_request(session_id, agent_id, {"a": 2}, agent_name=agent_name)
         assert seq1 == 8
         assert seq2 == 9
         assert (llm_dir / "0008_request.json").exists()
         assert (llm_dir / "0009_request.json").exists()
+
+
+def test_agent_dir_uses_name_between_prefix_and_id_suffix() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        path = storage.agent_dir(
+            "s-agent-dir",
+            "agent-08277a53f952",
+            agent_name="Tester",
+        )
+        assert path.name == "agent-tester-08277a53f952"
+
+
+def test_agent_dir_does_not_reuse_legacy_directory_name() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        session_id = "s-agent-reuse"
+        agent_id = "agent-08277a53f952"
+        agents_root = storage.agents_dir(session_id)
+
+        legacy = agents_root / agent_id
+        legacy.mkdir(parents=True, exist_ok=True)
+        resolved = storage.agent_dir(session_id, agent_id, agent_name="Tester")
+        assert resolved.name == "agent-tester-08277a53f952"
+        assert resolved != legacy
+
+
+def test_agent_dir_requires_name_for_agent_prefix_ids() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        with pytest.raises(ValueError, match="agent_name is required"):
+            storage.agent_dir("s-agent-name-required", "agent-08277a53f952")
+
+
+def test_turns_are_appended_and_loaded_in_original_order() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        session_id = "s-turns"
+        storage.append_turn(
+            session_id,
+            {"turn_id": "turn-a", "agent_id": "agent-1", "step": 1},
+        )
+        storage.append_turn(
+            session_id,
+            {"turn_id": "turn-b", "agent_id": "agent-2", "step": 1},
+        )
+        storage.append_turn(
+            session_id,
+            {"turn_id": "turn-c", "agent_id": "agent-1", "step": 2},
+        )
+
+        loaded = storage.load_turns(session_id)
+        assert [item["turn_id"] for item in loaded] == ["turn-a", "turn-b", "turn-c"]
+
+
+def test_load_turns_supports_agent_and_step_filters() -> None:
+    with TemporaryDirectory() as temp_dir:
+        storage = _new_storage(Path(temp_dir))
+        session_id = "s-turns-filter"
+        storage.append_turn(session_id, {"turn_id": "turn-a", "agent_id": "agent-1", "step": 1})
+        storage.append_turn(session_id, {"turn_id": "turn-b", "agent_id": "agent-2", "step": 1})
+        storage.append_turn(session_id, {"turn_id": "turn-c", "agent_id": "agent-1", "step": 2})
+
+        by_agent = storage.load_turns(session_id, agent_id="agent-1")
+        assert [item["turn_id"] for item in by_agent] == ["turn-a", "turn-c"]
+
+        by_agent_step = storage.load_turns(session_id, agent_id="agent-1", step=2)
+        assert [item["turn_id"] for item in by_agent_step] == ["turn-c"]

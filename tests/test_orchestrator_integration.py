@@ -470,9 +470,31 @@ class RootCancelBlockedLLM:
 
 
 class CancelUnknownAgentLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.saw_unknown_agent_error = False
+
     async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResult(
+                content=json.dumps({"actions": [{"type": "cancel_agent", "agent_id": "agent-missing"}]}),
+                raw_events=[],
+            )
+        payload = _extract_last_tool_payload(kwargs["messages"])
+        self.saw_unknown_agent_error = str(((payload.get("error") or {}).get("code") or "")) == "unknown_agent_id"
         return ChatResult(
-            content=json.dumps({"actions": [{"type": "cancel_agent", "agent_id": "agent-missing"}]}),
+            content=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "partial",
+                            "summary": "unknown agent handled as tool error",
+                        }
+                    ]
+                }
+            ),
             raw_events=[],
         )
 
@@ -587,8 +609,11 @@ class RetryInvalidToolCallThenSuccessLLM:
                 tool_calls=[
                     {
                         "id": "call-1",
-                        "name": "wait_time",
-                        "arguments_json": "{",
+                        "type": "function",
+                        "function": {
+                            "name": "wait_time",
+                            "arguments": "{",
+                        },
                     }
                 ],
             )
@@ -600,6 +625,65 @@ class RetryInvalidToolCallThenSuccessLLM:
                             "type": "finish",
                             "status": "completed",
                             "summary": "tool-call parse recovered",
+                        }
+                    ]
+                }
+            ),
+            raw_events=[],
+        )
+
+
+class ToolCallReplaySchemaLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.saw_openai_tool_call_schema = False
+
+    async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        messages = kwargs["messages"]
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResult(
+                content="",
+                raw_events=[],
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "wait_time",
+                            "arguments": "{\"seconds\":0}",
+                        },
+                    }
+                ],
+            )
+
+        replayed_assistant = next(
+            (
+                message
+                for message in reversed(messages)
+                if str(message.get("role", "")) == "assistant" and isinstance(message.get("tool_calls"), list)
+            ),
+            None,
+        )
+        tool_calls = replayed_assistant.get("tool_calls") if isinstance(replayed_assistant, dict) else []
+        first_call = tool_calls[0] if isinstance(tool_calls, list) and tool_calls else {}
+        function_payload = first_call.get("function") if isinstance(first_call, dict) else {}
+        self.saw_openai_tool_call_schema = bool(
+            isinstance(first_call, dict)
+            and first_call.get("type") == "function"
+            and isinstance(function_payload, dict)
+            and function_payload.get("name") == "wait_time"
+            and function_payload.get("arguments") == "{\"seconds\":0}"
+        )
+
+        return ChatResult(
+            content=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "completed",
+                            "summary": "replay schema ok",
                         }
                     ]
                 }
@@ -757,7 +841,7 @@ async def test_agent_artifacts_persist_llm_calls_and_context_compressions() -> N
         assert session.final_summary == "中文总结完成"
 
         root = orchestrator.agents[session.root_agent_id]
-        agent_dir = orchestrator.storage.agent_dir(session.id, root.id)
+        agent_dir = orchestrator.storage.agent_dir(session.id, root.id, agent_name=root.name)
         llm_dir = agent_dir / "llm_calls"
         context_dir = agent_dir / "context_compressions"
 
@@ -798,12 +882,82 @@ async def test_spawn_agent_default_is_non_blocking() -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_agent_capacity_limit_returns_structured_rejected_result() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        orchestrator.config.runtime.limits.max_active_agents = 1
+        root = AgentNode(
+            id="agent-root",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="spawn child",
+            workspace_path=project,
+            status=AgentStatus.RUNNING,
+        )
+        orchestrator.agents = {root.id: root}
+        orchestrator.tool_runs = {}
+        orchestrator._reset_runtime_trackers()
+
+        result = await orchestrator._execute_action(
+            agent=root,
+            action={
+                "type": "spawn_agent",
+                "name": "OverflowChild",
+                "instruction": "should not be created",
+            },
+        )
+
+        assert result["status"] == "rejected"
+        assert result["child_agent_id"] is None
+        assert result["error"]["code"] == "max_active_agents_limit_reached"
+        assert result["capacity"]["active_agents"] >= 1
+        assert len(root.children) == 0
+        assert len(orchestrator.agents) == 1
+
+        spawn_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "spawn_agent"]
+        assert len(spawn_runs) == 1
+        assert spawn_runs[0].status.value == "completed"
+        assert spawn_runs[0].error is None
+        assert isinstance(spawn_runs[0].result, dict)
+        assert spawn_runs[0].result["status"] == "rejected"
+
+
+@pytest.mark.asyncio
 async def test_wait_run_rejects_non_numeric_timeout() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
         with pytest.raises(ValueError, match="timeout_seconds must be numeric"):
             await orchestrator._tool_wait_run({"run_id": "tool-1", "timeout_seconds": "abc"})
+
+
+@pytest.mark.asyncio
+async def test_wait_run_uses_config_default_timeout_when_not_provided() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        orchestrator.config.runtime.tools.wait_run_timeout_seconds = 0.01
+        agent = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="wait run",
+            workspace_path=project,
+        )
+        run = orchestrator._create_tool_run(
+            agent=agent,
+            tool_name="shell",
+            arguments={"type": "shell", "command": "sleep 1"},
+            blocking=False,
+        )
+        orchestrator._mark_tool_run_running(run)
+        result = await orchestrator._tool_wait_run({"run_id": run.id})
+        assert result["timed_out"] is True
+        assert result["timeout_seconds"] == pytest.approx(0.01)
+        assert result["status"] == "running"
 
 
 @pytest.mark.asyncio
@@ -938,6 +1092,37 @@ async def test_shell_finishes_inline_within_shell_inline_wait_seconds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shell_uses_config_default_timeout_and_reports_timeout_details() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        orchestrator.config.runtime.tools.shell_inline_wait_seconds = 3.0
+        orchestrator.config.runtime.tools.shell_timeout_seconds = 1.0
+        agent = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="run shell",
+            workspace_path=project,
+        )
+        run = orchestrator._create_tool_run(
+            agent=agent,
+            tool_name="shell",
+            arguments={"type": "shell", "command": "python -c \"import time;time.sleep(2)\""},
+            blocking=True,
+        )
+        orchestrator._mark_tool_run_running(run)
+        with pytest.raises(ValueError, match="timed out after 1s"):
+            await orchestrator._tool_shell(run, {"command": "python -c \"import time;time.sleep(2)\""})
+        assert run.status.value == "failed"
+        assert run.error == "shell command timed out after 1s"
+        assert isinstance(run.result, dict)
+        assert run.result["timed_out"] is True
+        assert run.result["timeout_seconds"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_shell_exceeds_inline_wait_then_get_tool_run_shows_cumulative_output() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
@@ -984,6 +1169,38 @@ async def test_shell_exceeds_inline_wait_then_get_tool_run_shows_cumulative_outp
 
 
 @pytest.mark.asyncio
+async def test_shell_background_internal_error_marks_run_failed() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        agent = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="run shell",
+            workspace_path=project,
+        )
+        run = orchestrator._create_tool_run(
+            agent=agent,
+            tool_name="shell",
+            arguments={"type": "shell", "command": "echo hi", "cwd": "missing-dir"},
+            blocking=False,
+        )
+        orchestrator._mark_tool_run_running(run)
+        response = await orchestrator._tool_shell(
+            run,
+            {"command": "echo hi", "cwd": "missing-dir", "timeout_seconds": 5},
+        )
+        assert response["status"] == "running"
+
+        wait_result = await orchestrator._tool_wait_run({"run_id": run.id, "timeout_seconds": 2})
+        assert wait_result["timed_out"] is False
+        assert wait_result["status"] == "failed"
+        assert str(wait_result.get("error", "")).strip()
+
+
+@pytest.mark.asyncio
 async def test_worker_exception_recorded_and_visible_via_get_agent_run() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
@@ -1020,15 +1237,74 @@ async def test_cancel_agent_cannot_cancel_root() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_agent_unknown_agent_id_fails_session() -> None:
+async def test_cancel_agent_unknown_agent_id_returns_structured_error_without_failing_session() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         llm = CancelUnknownAgentLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
         session = await orchestrator.run_task("attempt cancel unknown")
-        assert session.status.value == "failed"
-        root = orchestrator.agents[session.root_agent_id]
-        assert "unknown agent_id: agent-missing" in str(root.status_reason)
+        assert session.status.value == "completed"
+        assert llm.saw_unknown_agent_error is True
+        cancel_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "cancel_agent"]
+        assert len(cancel_runs) == 1
+        assert cancel_runs[0].status.value == "failed"
+        assert cancel_runs[0].error == "unknown agent_id: agent-missing"
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_name_returns_failed_tool_run_payload() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        root = AgentNode(
+            id="agent-root",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="root",
+            workspace_path=project,
+        )
+        orchestrator.agents = {root.id: root}
+        orchestrator.tool_runs = {}
+        orchestrator._reset_runtime_trackers()
+
+        result = await orchestrator._execute_action(agent=root, action={})
+        assert result["ok"] is False
+        assert result["tool_name"] == "<missing>"
+        assert result["error"]["code"] == "missing_tool_name"
+
+        failed_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "<missing>"]
+        assert len(failed_runs) == 1
+        assert failed_runs[0].status.value == "failed"
+        assert failed_runs[0].error == "action type is required"
+
+
+@pytest.mark.asyncio
+async def test_disabled_tool_name_returns_failed_tool_run_payload() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        root = AgentNode(
+            id="agent-root",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="root",
+            workspace_path=project,
+        )
+        orchestrator.agents = {root.id: root}
+        orchestrator.tool_runs = {}
+        orchestrator._reset_runtime_trackers()
+
+        result = await orchestrator._execute_action(agent=root, action={"type": "not_enabled_tool"})
+        assert result["ok"] is False
+        assert result["tool_name"] == "not_enabled_tool"
+        assert result["error"]["code"] == "tool_not_enabled_for_role"
+
+        failed_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "not_enabled_tool"]
+        assert len(failed_runs) == 1
+        assert failed_runs[0].status.value == "failed"
+        assert "not enabled for role root" in str(failed_runs[0].error)
 
 
 @pytest.mark.asyncio
@@ -1080,6 +1356,19 @@ async def test_protocol_retry_recovers_from_invalid_tool_call_arguments() -> Non
 
 
 @pytest.mark.asyncio
+async def test_replayed_assistant_tool_call_uses_openai_compatible_shape() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = ToolCallReplaySchemaLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        session = await orchestrator.run_task("verify assistant tool-call replay shape")
+        assert session.status.value == "completed"
+        assert session.final_summary == "replay schema ok"
+        assert llm.calls == 2
+        assert llm.saw_openai_tool_call_schema is True
+
+
+@pytest.mark.asyncio
 async def test_protocol_retry_exhaustion_falls_back_to_invalid_payload_finish() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
@@ -1090,3 +1379,55 @@ async def test_protocol_retry_exhaustion_falls_back_to_invalid_payload_finish() 
         assert session.status.value == "completed"
         assert session.final_summary == "Model returned invalid action payload."
         assert llm.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_turn_index_records_step_attempts_and_llm_events() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = RetryInvalidToolCallThenSuccessLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        orchestrator.config.runtime.limits.max_protocol_retries = 1
+        session = await orchestrator.run_task("turn index retry")
+        assert session.status.value == "completed"
+
+        turns = orchestrator.storage.load_turns(session.id)
+        assert len(turns) == 1
+        turn = turns[0]
+        assert turn["agent_id"] == session.root_agent_id
+        assert int(turn["step"]) == 1
+        assert turn["status"] == "completed"
+        assert int(turn["final_attempt"]) == 2
+        attempts = [item for item in turn["attempts"] if isinstance(item, dict)]
+        assert len(attempts) == 2
+        assert attempts[0]["request_file"].endswith("0001_request.json")
+        assert attempts[0]["response_file"].endswith("0001_response.json")
+        assert attempts[0]["ok"] is False
+        assert attempts[1]["ok"] is True
+        assert turn["actions"][0]["type"] == "finish"
+        assert len([item for item in turn["action_results"] if isinstance(item, dict)]) >= 1
+        assert int(turn["event_seq_start"]) > 0
+        assert int(turn["event_seq_end"]) >= int(turn["event_seq_start"])
+
+        event_types = {str(item.get("event_type", "")) for item in orchestrator.storage.load_events(session.id)}
+        assert "agent_step_started" in event_types
+        assert "agent_step_finished" in event_types
+        assert "llm_call_request_recorded" in event_types
+        assert "llm_call_response_recorded" in event_types
+
+
+@pytest.mark.asyncio
+async def test_turn_index_keeps_root_and_worker_steps_separate() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = BlockingSpawnLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        session = await orchestrator.run_task("turn index root worker")
+        assert session.status.value == "completed"
+
+        turns = orchestrator.storage.load_turns(session.id)
+        assert len(turns) >= 2
+        agent_ids = {str(item.get("agent_id", "")) for item in turns}
+        assert session.root_agent_id in agent_ids
+        assert any(agent_id != session.root_agent_id for agent_id in agent_ids)
+        assert all(int(item.get("step", 0) or 0) >= 1 for item in turns)

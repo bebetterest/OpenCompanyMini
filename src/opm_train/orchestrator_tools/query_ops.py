@@ -96,11 +96,14 @@ class QueryToolMixin:
         }
 
     async def _tool_wait_run(self, action: dict[str, Any]) -> dict[str, Any]:
-        """Wait for a tool run to finish with optional timeout."""
+        """Wait for a tool run to finish with action/config timeout fallback."""
         run_id = str(action.get("run_id", "")).strip()
         if not run_id:
             raise ValueError("wait_run requires run_id")
-        timeout_seconds = _parse_timeout_seconds(action.get("timeout_seconds"))
+        timeout_seconds = _resolve_wait_run_timeout_seconds(
+            action.get("timeout_seconds"),
+            default=float(self.config.runtime.tools.wait_run_timeout_seconds),
+        )
         return await self._wait_for_tool_run(run_id, timeout_seconds=timeout_seconds)
 
     async def _wait_for_tool_run(self, run_id: str, *, timeout_seconds: float | None) -> dict[str, Any]:
@@ -120,6 +123,7 @@ class QueryToolMixin:
         return {
             "run_id": run_id,
             "timed_out": timed_out,
+            "timeout_seconds": timeout_seconds,
             "status": run.status.value,
             "result": run.result,
             "error": run.error,
@@ -193,14 +197,20 @@ def _paginate(items: list[Any], *, offset: int, limit: int) -> tuple[list[Any], 
     return page, next_cursor
 
 
-def _parse_timeout_seconds(value: Any) -> float | None:
-    """Parse optional timeout value for wait operations."""
-    if value is None:
-        return None
+def _parse_timeout_seconds(value: Any) -> float:
+    """Parse wait timeout value as non-negative float."""
     try:
         return max(0.0, float(value))
     except (TypeError, ValueError) as exc:
         raise ValueError("wait_run timeout_seconds must be numeric") from exc
+
+
+def _resolve_wait_run_timeout_seconds(value: Any, *, default: float) -> float | None:
+    """Resolve effective wait_run timeout using action override then config fallback."""
+    seconds = _parse_timeout_seconds(default if value is None else value)
+    if seconds <= 0.0:
+        return None
+    return seconds
 
 
 def _agent_run_payload(agent: AgentNode) -> dict[str, Any]:

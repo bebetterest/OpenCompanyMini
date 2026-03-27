@@ -11,7 +11,13 @@ from opm_train.context import maybe_auto_compress
 from opm_train.loop import ActionBatchResult, AgentLoopRunner
 from opm_train.loop_hooks import LoopContext
 from opm_train.models import AgentNode, AgentRole, AgentStatus, ToolRun
-from opm_train.protocol import ProtocolError, extract_json_object, normalize_actions, normalize_tool_calls
+from opm_train.protocol import (
+    ProtocolError,
+    canonicalize_tool_calls,
+    extract_json_object,
+    normalize_actions,
+    normalize_tool_calls,
+)
 from opm_train.tools import TERMINAL_AGENT_STATUSES, TERMINAL_TOOL_RUN_STATUSES, validate_finish_action
 from opm_train.utils import json_ready, utc_now
 
@@ -64,6 +70,13 @@ class OrchestratorAgentLifecycleMixin:
         except Exception as exc:  # pragma: no cover - safety net
             self._record_agent_exception(agent=agent, exc=exc)
         finally:
+            if agent.id in self.active_turns:
+                status = "cancelled" if agent.status == AgentStatus.CANCELLED else "failed"
+                self._finalize_turn(
+                    agent=agent,
+                    status=status,
+                    step_error=agent.status_reason or "agent_terminated_before_step_completed",
+                )
             if agent.status.value not in TERMINAL_AGENT_STATUSES:
                 agent.status = AgentStatus.FAILED
                 agent.status_reason = "agent_finished_without_terminal_status"
@@ -93,12 +106,183 @@ class OrchestratorAgentLifecycleMixin:
         agent.status_reason = f"agent_loop_error:{error_type}:{error_message}"
         if not str(agent.summary or "").strip():
             agent.summary = f"{error_type}: {error_message}"
+        self._finalize_turn(
+            agent=agent,
+            status="failed",
+            step_error=f"{error_type}: {error_message}",
+        )
         self._record_exception(stage="agent_loop", exc=exc, agent=agent, payload={"error": error_payload})
         self._log_event(agent, "agent_failed", {"error": error_payload})
+
+    def _ensure_active_turn(self, *, agent: AgentNode) -> dict[str, Any]:
+        """Ensure one active step-turn exists for the current agent step."""
+        step = max(0, int(agent.step_count))
+        existing = self.active_turns.get(agent.id)
+        if existing is not None and int(existing.get("step", 0)) == step:
+            return existing
+        turn_id = f"turn-{agent.id}-{step:04d}"
+        turn = {
+            "turn_id": turn_id,
+            "session_id": agent.session_id,
+            "agent_id": agent.id,
+            "agent_role": agent.role.value,
+            "parent_agent_id": agent.parent_agent_id,
+            "step": step,
+            "status": "running",
+            "started_at": utc_now(),
+            "completed_at": None,
+            "event_seq_start": self.event_seq + 1,
+            "event_seq_end": None,
+            "attempts": [],
+            "final_attempt": None,
+            "actions": [],
+            "action_results": [],
+            "finish_payload": None,
+            "step_error": None,
+        }
+        self.active_turns[agent.id] = turn
+        self._log_event(
+            agent,
+            "agent_step_started",
+            {
+                "turn_id": turn_id,
+                "step": step,
+            },
+        )
+        turn["event_seq_start"] = self.event_seq
+        return turn
+
+    def _record_turn_attempt_request(
+        self,
+        *,
+        agent: AgentNode,
+        attempt: int,
+        llm_sequence: int,
+    ) -> None:
+        """Attach request artifact references for one protocol attempt."""
+        if self.session is None:
+            return
+        turn = self._ensure_active_turn(agent=agent)
+        request_path = self.storage.agent_llm_call_request_path(
+            self.session.id,
+            agent.id,
+            llm_sequence,
+            agent_name=agent.name,
+        )
+        turn["attempts"].append(
+            {
+                "attempt": int(attempt),
+                "llm_sequence": int(llm_sequence),
+                "request_file": self._relative_session_path(request_path),
+                "response_file": None,
+                "ok": False,
+                "parse_error": None,
+            }
+        )
+
+    def _record_turn_attempt_response(
+        self,
+        *,
+        agent: AgentNode,
+        attempt: int,
+        llm_sequence: int,
+        ok: bool,
+        parse_error: str | None,
+    ) -> None:
+        """Attach response artifact references and outcome for one attempt."""
+        if self.session is None:
+            return
+        turn = self._ensure_active_turn(agent=agent)
+        response_path = self.storage.agent_llm_call_response_path(
+            self.session.id,
+            agent.id,
+            llm_sequence,
+            agent_name=agent.name,
+        )
+        attempts = [item for item in turn.get("attempts", []) if isinstance(item, dict)]
+        for item in reversed(attempts):
+            if int(item.get("attempt", -1)) != int(attempt):
+                continue
+            if int(item.get("llm_sequence", -1)) != int(llm_sequence):
+                continue
+            item["response_file"] = self._relative_session_path(response_path)
+            item["ok"] = bool(ok)
+            item["parse_error"] = str(parse_error) if parse_error else None
+            break
+
+    def _record_turn_actions(self, *, agent: AgentNode, actions: list[dict[str, Any]]) -> None:
+        """Persist normalized action list attached to the active step turn."""
+        turn = self._ensure_active_turn(agent=agent)
+        turn["actions"] = json_ready(actions)
+
+    def _record_turn_action_result(self, *, agent: AgentNode, action: dict[str, Any], result: dict[str, Any]) -> None:
+        """Append one action-result pair for active step turn."""
+        turn = self._ensure_active_turn(agent=agent)
+        action_results = turn.get("action_results")
+        if not isinstance(action_results, list):
+            action_results = []
+            turn["action_results"] = action_results
+        action_results.append(
+            {
+                "action": json_ready(action),
+                "result": json_ready(result),
+            }
+        )
+
+    def _record_turn_final_attempt(self, *, agent: AgentNode, attempt: int) -> None:
+        """Mark final successful protocol attempt for active step turn."""
+        turn = self._ensure_active_turn(agent=agent)
+        turn["final_attempt"] = int(attempt)
+
+    def _finalize_turn(
+        self,
+        *,
+        agent: AgentNode,
+        status: str,
+        finish_payload: dict[str, Any] | None = None,
+        step_error: str | None = None,
+    ) -> None:
+        """Finalize and persist active turn payload for one step."""
+        if self.session is None:
+            return
+        turn = self.active_turns.pop(agent.id, None)
+        if turn is None:
+            return
+        turn["status"] = str(status).strip().lower() or "failed"
+        turn["completed_at"] = utc_now()
+        turn["step_error"] = str(step_error).strip() if step_error else None
+        turn["finish_payload"] = json_ready(finish_payload) if isinstance(finish_payload, dict) else None
+        self._log_event(
+            agent,
+            "agent_step_finished",
+            {
+                "turn_id": turn.get("turn_id"),
+                "step": turn.get("step"),
+                "status": turn["status"],
+                "final_attempt": turn.get("final_attempt"),
+                "attempt_count": len([item for item in turn.get("attempts", []) if isinstance(item, dict)]),
+                "step_error": turn["step_error"],
+            },
+        )
+        turn["event_seq_end"] = self.event_seq
+        self.storage.append_turn(self.session.id, json_ready(turn))
+
+    def _relative_session_path(self, path: Any) -> str:
+        """Convert absolute artifact path into session-relative stable path."""
+        if self.session is None:
+            return str(path)
+        session_dir = self.storage.session_dir(self.session.id)
+        resolved = getattr(path, "resolve", lambda: path)()
+        try:
+            relative = resolved.relative_to(session_dir)
+            return str(relative)
+        except Exception:
+            return str(resolved)
 
     async def _ask_agent(self, agent: AgentNode) -> list[dict[str, Any]]:
         """Assemble context, call model, and normalize response into actions."""
         with self._timer_scope("ask_agent", agent=agent):
+            self._ensure_active_turn(agent=agent)
             self._maybe_record_auto_compression(agent)
             self._apply_pending_steers(agent)
 
@@ -143,6 +327,11 @@ class OrchestratorAgentLifecycleMixin:
                         "tools": json_ready(tools),
                     },
                 )
+                self._record_turn_attempt_request(
+                    agent=agent,
+                    attempt=attempt + 1,
+                    llm_sequence=llm_sequence,
+                )
                 on_token, on_reasoning, on_retry = self._llm_callbacks(agent)
 
                 try:
@@ -175,6 +364,13 @@ class OrchestratorAgentLifecycleMixin:
                             "error": str(exc),
                         },
                     )
+                    self._record_turn_attempt_response(
+                        agent=agent,
+                        attempt=attempt + 1,
+                        llm_sequence=llm_sequence,
+                        ok=False,
+                        parse_error=str(exc),
+                    )
                     self._record_exception(
                         stage="llm_call",
                         exc=exc,
@@ -187,11 +383,12 @@ class OrchestratorAgentLifecycleMixin:
                     )
                     raise
 
+                canonical_tool_calls = canonicalize_tool_calls(result.tool_calls)
                 assistant_message = {
                     "role": "assistant",
                     "content": result.content,
                     "reasoning": result.reasoning,
-                    "tool_calls": result.tool_calls,
+                    "tool_calls": canonical_tool_calls,
                 }
                 agent.conversation.append(assistant_message)
                 response_payload = {
@@ -202,7 +399,7 @@ class OrchestratorAgentLifecycleMixin:
                     **inference_metadata,
                     "content": result.content,
                     "reasoning": result.reasoning,
-                    "tool_calls": json_ready(result.tool_calls),
+                    "tool_calls": json_ready(canonical_tool_calls),
                     "usage": json_ready(result.usage),
                     "raw_events": json_ready(result.raw_events),
                 }
@@ -212,18 +409,33 @@ class OrchestratorAgentLifecycleMixin:
                         agent=agent,
                         payload={"protocol_attempt": attempt + 1, "sequence": llm_sequence},
                     ):
-                        if result.tool_calls:
-                            actions = normalize_tool_calls(result.tool_calls)
+                        if canonical_tool_calls:
+                            actions = normalize_tool_calls(canonical_tool_calls)
                         else:
                             payload = extract_json_object(result.content)
                             actions = normalize_actions(payload)
                     response_payload["actions"] = json_ready(actions)
                     self._record_llm_call_response(agent=agent, sequence=llm_sequence, payload=response_payload)
+                    self._record_turn_attempt_response(
+                        agent=agent,
+                        attempt=attempt + 1,
+                        llm_sequence=llm_sequence,
+                        ok=True,
+                        parse_error=None,
+                    )
+                    self._record_turn_final_attempt(agent=agent, attempt=attempt + 1)
                     return actions
                 except ProtocolError as exc:
                     response_payload["ok"] = False
                     response_payload["parse_error"] = str(exc)
                     self._record_llm_call_response(agent=agent, sequence=llm_sequence, payload=response_payload)
+                    self._record_turn_attempt_response(
+                        agent=agent,
+                        attempt=attempt + 1,
+                        llm_sequence=llm_sequence,
+                        ok=False,
+                        parse_error=str(exc),
+                    )
                     self._log_event(
                         agent,
                         "invalid_model_response",
@@ -369,23 +581,40 @@ class OrchestratorAgentLifecycleMixin:
             agent=agent,
             payload={"step": context.step, "action_count": len(actions)},
         ):
+            self._ensure_active_turn(agent=agent)
+            self._record_turn_actions(agent=agent, actions=actions)
             finish_payload: dict[str, Any] | None = None
-            for action in actions:
-                await self.hooks.before_action(agent=agent, context=context, action=action)
-                result = await self._execute_action(agent=agent, action=action)
-                agent.conversation.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": str(action.get("_tool_call_id", "")),
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
+            try:
+                for action in actions:
+                    await self.hooks.before_action(agent=agent, context=context, action=action)
+                    result = await self._execute_action(agent=agent, action=action)
+                    self._record_turn_action_result(agent=agent, action=action, result=result)
+                    agent.conversation.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(action.get("_tool_call_id", "")),
+                            "content": json.dumps(result, ensure_ascii=False),
+                        }
+                    )
+                    await self.hooks.after_action(agent=agent, context=context, action=action, result=result)
+                    if isinstance(result.get("finish_payload"), dict):
+                        finish_payload = dict(result["finish_payload"])
+                        break
+                self._finalize_turn(
+                    agent=agent,
+                    status="completed",
+                    finish_payload=finish_payload,
                 )
-                await self.hooks.after_action(agent=agent, context=context, action=action, result=result)
-                if isinstance(result.get("finish_payload"), dict):
-                    finish_payload = dict(result["finish_payload"])
-                    break
-            self._persist_snapshot()
-            return ActionBatchResult(finish_payload=finish_payload)
+                self._persist_snapshot()
+                return ActionBatchResult(finish_payload=finish_payload)
+            except Exception as exc:
+                self._finalize_turn(
+                    agent=agent,
+                    status="failed",
+                    step_error=f"{type(exc).__name__}: {exc}",
+                )
+                self._persist_snapshot()
+                raise
 
     async def _forced_finish(self, agent: AgentNode) -> dict[str, Any] | None:
         """Provide deterministic finish payload when step budget is exhausted."""
@@ -404,9 +633,21 @@ class OrchestratorAgentLifecycleMixin:
         """Execute one validated action and persist tool-run lifecycle."""
         action_type = str(action.get("type", "")).strip()
         if not action_type:
-            raise ValueError("action type is required")
+            return self._reject_tool_action(
+                agent=agent,
+                action=action,
+                tool_name="<missing>",
+                error_code="missing_tool_name",
+                error_message="action type is required",
+            )
         if action_type not in set(self.config.runtime.tools.tool_names_for_role(agent.role.value)):
-            raise ValueError(f"tool '{action_type}' is not enabled for role {agent.role.value}")
+            return self._reject_tool_action(
+                agent=agent,
+                action=action,
+                tool_name=action_type,
+                error_code="tool_not_enabled_for_role",
+                error_message=f"tool '{action_type}' is not enabled for role {agent.role.value}",
+            )
 
         if action_type == "finish":
             return self._handle_finish_action(agent=agent, action=action)

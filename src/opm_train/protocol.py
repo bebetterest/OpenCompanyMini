@@ -53,14 +53,11 @@ def normalize_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def normalize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Map tool-call deltas to runtime action shape."""
+    """Map OpenAI-compatible tool calls to runtime action shape."""
     normalized: list[dict[str, Any]] = []
     for call in tool_calls:
-        name = str(call.get("name", "")).strip()
-        if not name:
-            raise ProtocolError("Tool call is missing name")
+        name, arguments_json = _tool_call_name_and_arguments(call)
         call_id = str(call.get("id", "")).strip()
-        arguments_json = str(call.get("arguments_json", "{}")).strip() or "{}"
         try:
             arguments = json.loads(arguments_json)
         except json.JSONDecodeError as exc:
@@ -69,3 +66,40 @@ def normalize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
             raise ProtocolError(f"Tool arguments for '{name}' must decode to a JSON object")
         normalized.append({"type": name, "_tool_call_id": call_id, **arguments})
     return normalized
+
+
+def canonicalize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return validated provider-safe tool-call objects in OpenAI format only."""
+    normalized: list[dict[str, Any]] = []
+    for index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+        name, arguments_json = _tool_call_name_and_arguments(call)
+        normalized.append(
+            {
+                "id": str(call.get("id", "")).strip() or f"tool-call-{index}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments_json},
+            }
+        )
+    return normalized
+
+
+def _tool_call_name_and_arguments(call: dict[str, Any]) -> tuple[str, str]:
+    """Extract strict OpenAI-compatible tool-call name and arguments JSON."""
+    call_type = str(call.get("type", "")).strip()
+    if call_type != "function":
+        raise ProtocolError("Tool call type must be 'function'")
+
+    function_payload = call.get("function")
+    if not isinstance(function_payload, dict):
+        raise ProtocolError("Tool call is missing function payload")
+
+    name = str(function_payload.get("name", "")).strip()
+    if not name:
+        raise ProtocolError("Tool call is missing function name")
+
+    raw_arguments: Any = function_payload.get("arguments")
+    if isinstance(raw_arguments, (dict, list)):
+        return name, json.dumps(raw_arguments, ensure_ascii=False)
+    return name, str(raw_arguments if raw_arguments is not None else "{}").strip() or "{}"

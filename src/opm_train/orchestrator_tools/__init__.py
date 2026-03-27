@@ -105,6 +105,77 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
         default = spec.default_blocking if spec is not None else True
         return _as_bool(action.get("blocking"), default=default)
 
+    def _reject_tool_action(
+        self,
+        *,
+        agent: AgentNode,
+        action: dict[str, Any],
+        tool_name: str,
+        error_code: str,
+        error_message: str,
+    ) -> dict[str, Any]:
+        """Create one failed tool run and return a structured non-throwing error payload."""
+        run = self._create_tool_run(
+            agent=agent,
+            tool_name=tool_name,
+            arguments=action,
+            blocking=True,
+        )
+        self._mark_tool_run_running(run)
+        self._fail_tool_run(run, error=error_message)
+        exc = ValueError(error_message)
+        result = self._tool_error_result(
+            run=run,
+            action=action,
+            exc=exc,
+            error_code=error_code,
+        )
+        self._record_exception(
+            stage="tool_action_validation",
+            exc=exc,
+            agent=agent,
+            payload={
+                "tool_name": tool_name,
+                "tool_run_id": run.id,
+                "action": json_ready(action),
+            },
+        )
+        self._log_event(
+            agent,
+            "tool_call_failed",
+            {
+                "action": json_ready(action),
+                "error": json_ready(result.get("error")),
+                "tool_run_id": run.id,
+            },
+        )
+        self._persist_snapshot()
+        return result
+
+    def _tool_error_result(
+        self,
+        *,
+        run: ToolRun,
+        action: dict[str, Any],
+        exc: BaseException,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one canonical runtime payload for tool execution failure."""
+        message = str(exc).strip() or "<empty>"
+        code = error_code or _infer_tool_error_code(tool_name=run.tool_name, message=message)
+        return {
+            "ok": False,
+            "tool_name": run.tool_name,
+            "tool_run_id": run.id,
+            "tool_run_status": run.status.value,
+            "error": {
+                "code": code,
+                "type": type(exc).__name__,
+                "message": message,
+            },
+            "action": json_ready(action),
+        }
+
     async def _execute_tool_action(self, *, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:
         """Execute one non-finish action and persist tool-run lifecycle."""
         action_type = str(action.get("type", "")).strip()
@@ -130,6 +201,11 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
         except Exception as exc:
             if run.status not in {ToolRunStatus.CANCELLED, ToolRunStatus.COMPLETED, ToolRunStatus.FAILED}:
                 self._fail_tool_run(run, error=str(exc))
+            result = self._tool_error_result(
+                run=run,
+                action=action,
+                exc=exc,
+            )
             self._record_exception(
                 stage="tool_action",
                 exc=exc,
@@ -140,8 +216,16 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
                     "action": json_ready(action),
                 },
             )
-            self._log_event(agent, "tool_call_failed", {"action": json_ready(action), "error": str(exc), "tool_run_id": run.id})
-            raise
+            self._log_event(
+                agent,
+                "tool_call_failed",
+                {
+                    "action": json_ready(action),
+                    "error": json_ready(result.get("error")),
+                    "tool_run_id": run.id,
+                },
+            )
+            return result
         finally:
             self._persist_snapshot()
 
@@ -160,3 +244,30 @@ def _as_bool(value: Any, *, default: bool) -> bool:
     if text in {"false", "0", "no", "n", "off", ""}:
         return False
     return bool(value)
+
+
+def _infer_tool_error_code(*, tool_name: str, message: str) -> str:
+    """Map common tool failure messages to stable machine-readable error codes."""
+    text = str(message).strip().lower()
+    name = str(tool_name).strip().lower()
+    if "action type is required" in text:
+        return "missing_tool_name"
+    if "not enabled for role" in text:
+        return "tool_not_enabled_for_role"
+    if "unsupported action type" in text:
+        return "unsupported_tool_name"
+    if "unknown agent_id" in text:
+        return "unknown_agent_id"
+    if "unknown tool run" in text:
+        return "unknown_tool_run_id"
+    if "requires agent_id" in text:
+        return "missing_agent_id"
+    if "requires run_id" in text:
+        return "missing_run_id"
+    if "requires non-empty command" in text:
+        return "missing_command"
+    if name == "shell" and "timed out" in text:
+        return "shell_timeout"
+    if "cancelled" in text:
+        return "tool_cancelled"
+    return "tool_execution_error"

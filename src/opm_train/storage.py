@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from opm_train.utils import ensure_directory
 
 SNAPSHOT_FILENAME = "state_snapshot.json"
 EVENTS_FILENAME = "events.jsonl"
+TURNS_FILENAME = "turns.jsonl"
 AGENTS_DIRNAME = "agents"
 LLM_CALLS_DIRNAME = "llm_calls"
 CONTEXT_COMPRESSIONS_DIRNAME = "context_compressions"
@@ -50,21 +52,47 @@ class SessionStorage:
         """Return path to append-only JSONL event file."""
         return self.session_dir(session_id) / EVENTS_FILENAME
 
+    def turns_path(self, session_id: str) -> Path:
+        """Return path to append-only per-step turn index JSONL file."""
+        return self.session_dir(session_id) / TURNS_FILENAME
+
     def snapshot_path(self, session_id: str) -> Path:
         """Return path to structured snapshot JSON file."""
         return self.session_dir(session_id) / SNAPSHOT_FILENAME
 
-    def agent_dir(self, session_id: str, agent_id: str) -> Path:
-        """Return per-agent directory within one session."""
-        return ensure_directory(self.session_dir(session_id) / AGENTS_DIRNAME / str(agent_id))
+    def agents_dir(self, session_id: str) -> Path:
+        """Return per-session agents root directory."""
+        return ensure_directory(self.session_dir(session_id) / AGENTS_DIRNAME)
 
-    def agent_llm_calls_dir(self, session_id: str, agent_id: str) -> Path:
+    def agent_dir(self, session_id: str, agent_id: str, *, agent_name: str | None = None) -> Path:
+        """Return per-agent directory within one session.
+
+        New directories are named as ``agent-<name_slug>-<id_suffix>`` when
+        ``agent_id`` starts with ``agent-`` and ``agent_name`` is available
+        (for example ``agent-tester-08277a53f952``).
+        """
+        session_key = _normalized_text(session_id)
+        agent_key = _normalized_text(agent_id)
+        resolved_name = _resolve_agent_name(agent_id=agent_key, agent_name=agent_name)
+        agents_root = self.agents_dir(session_key)
+        target = agents_root / _agent_dirname(agent_key, resolved_name)
+        return ensure_directory(target)
+
+    def agent_llm_calls_dir(self, session_id: str, agent_id: str, *, agent_name: str | None = None) -> Path:
         """Return per-agent LLM call directory."""
-        return ensure_directory(self.agent_dir(session_id, agent_id) / LLM_CALLS_DIRNAME)
+        return ensure_directory(self.agent_dir(session_id, agent_id, agent_name=agent_name) / LLM_CALLS_DIRNAME)
 
-    def agent_context_compressions_dir(self, session_id: str, agent_id: str) -> Path:
+    def agent_context_compressions_dir(
+        self,
+        session_id: str,
+        agent_id: str,
+        *,
+        agent_name: str | None = None,
+    ) -> Path:
         """Return per-agent context compression directory."""
-        return ensure_directory(self.agent_dir(session_id, agent_id) / CONTEXT_COMPRESSIONS_DIRNAME)
+        return ensure_directory(
+            self.agent_dir(session_id, agent_id, agent_name=agent_name) / CONTEXT_COMPRESSIONS_DIRNAME
+        )
 
     def logs_dir(self, session_id: str) -> Path:
         """Return per-session log directory."""
@@ -90,6 +118,10 @@ class SessionStorage:
         """Append one event record as compact JSON line."""
         self._append_jsonl(self.events_path(session_id), payload)
 
+    def append_turn(self, session_id: str, payload: dict[str, Any]) -> None:
+        """Append one turn record as compact JSON line."""
+        self._append_jsonl(self.turns_path(session_id), payload)
+
     def append_runtime_log(self, session_id: str, payload: dict[str, Any]) -> None:
         """Append one structured runtime log line."""
         self._append_jsonl(self.runtime_log_path(session_id), payload)
@@ -102,11 +134,26 @@ class SessionStorage:
         """Append one per-module timing sample."""
         self._append_jsonl(self.module_timing_path(session_id), payload)
 
-    def append_agent_llm_call_request(self, session_id: str, agent_id: str, payload: dict[str, Any]) -> int:
+    def append_agent_llm_call_request(
+        self,
+        session_id: str,
+        agent_id: str,
+        payload: dict[str, Any],
+        *,
+        agent_name: str | None = None,
+    ) -> int:
         """Append one per-agent LLM request payload and return sequence index."""
-        llm_dir = self.agent_llm_calls_dir(session_id, agent_id)
+        llm_dir = self.agent_llm_calls_dir(session_id, agent_id, agent_name=agent_name)
         sequence = self._next_sequence(llm_dir)
-        self._write_json(llm_dir / f"{sequence:04d}_request.json", payload)
+        self._write_json(
+            self.agent_llm_call_request_path(
+                session_id,
+                agent_id,
+                sequence,
+                agent_name=agent_name,
+            ),
+            payload,
+        )
         return sequence
 
     def append_agent_llm_call_response(
@@ -115,16 +162,33 @@ class SessionStorage:
         agent_id: str,
         sequence: int,
         payload: dict[str, Any],
+        *,
+        agent_name: str | None = None,
     ) -> Path:
         """Append one per-agent LLM response payload for the given sequence."""
-        llm_dir = self.agent_llm_calls_dir(session_id, agent_id)
-        path = llm_dir / f"{max(1, int(sequence)):04d}_response.json"
+        path = self.agent_llm_call_response_path(
+            session_id,
+            agent_id,
+            sequence,
+            agent_name=agent_name,
+        )
         self._write_json(path, payload)
         return path
 
-    def append_agent_context_compression(self, session_id: str, agent_id: str, payload: dict[str, Any]) -> int:
+    def append_agent_context_compression(
+        self,
+        session_id: str,
+        agent_id: str,
+        payload: dict[str, Any],
+        *,
+        agent_name: str | None = None,
+    ) -> int:
         """Append one context compression record for an agent."""
-        compression_dir = self.agent_context_compressions_dir(session_id, agent_id)
+        compression_dir = self.agent_context_compressions_dir(
+            session_id,
+            agent_id,
+            agent_name=agent_name,
+        )
         sequence = self._next_sequence(compression_dir)
         self._write_json(compression_dir / f"{sequence:04d}.json", payload)
         return sequence
@@ -142,6 +206,62 @@ class SessionStorage:
             if isinstance(payload, dict):
                 events.append(payload)
         return events
+
+    def load_turns(
+        self,
+        session_id: str,
+        *,
+        agent_id: str | None = None,
+        step: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load turn records for a session with optional agent/step filtering."""
+        path = self.turns_path(session_id)
+        if not path.exists():
+            return []
+        agent_filter = str(agent_id).strip() if agent_id is not None else None
+        step_filter = int(step) if step is not None else None
+        turns: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                continue
+            if agent_filter is not None and str(payload.get("agent_id", "")).strip() != agent_filter:
+                continue
+            if step_filter is not None:
+                try:
+                    payload_step = int(payload.get("step", -1))
+                except (TypeError, ValueError):
+                    continue
+                if payload_step != step_filter:
+                    continue
+            turns.append(payload)
+        return turns
+
+    def agent_llm_call_request_path(
+        self,
+        session_id: str,
+        agent_id: str,
+        sequence: int,
+        *,
+        agent_name: str | None = None,
+    ) -> Path:
+        """Return per-agent request artifact path for one LLM sequence."""
+        llm_dir = self.agent_llm_calls_dir(session_id, agent_id, agent_name=agent_name)
+        return llm_dir / f"{max(1, int(sequence)):04d}_request.json"
+
+    def agent_llm_call_response_path(
+        self,
+        session_id: str,
+        agent_id: str,
+        sequence: int,
+        *,
+        agent_name: str | None = None,
+    ) -> Path:
+        """Return per-agent response artifact path for one LLM sequence."""
+        llm_dir = self.agent_llm_calls_dir(session_id, agent_id, agent_name=agent_name)
+        return llm_dir / f"{max(1, int(sequence)):04d}_response.json"
 
     def write_snapshot(self, session_id: str, snapshot: SnapshotState) -> None:
         """Write snapshot payload as pretty JSON for inspectability."""
@@ -304,6 +424,54 @@ def _optional_str(value: Any) -> str | None:
     return text if text else None
 
 
+def _normalized_text(value: Any) -> str:
+    """Return stripped text, falling back to raw string when strip is empty."""
+    text = str(value)
+    stripped = text.strip()
+    return stripped or text
+
+
+def _resolve_agent_name(*, agent_id: str, agent_name: str | None) -> str | None:
+    """Return normalized agent name and enforce naming contract for runtime ids."""
+    resolved_id = _normalized_text(agent_id)
+    if agent_name is None:
+        resolved_name = ""
+    else:
+        resolved_name = str(agent_name).strip()
+    if resolved_id.startswith("agent-") and not resolved_name:
+        raise ValueError("agent_name is required for agent-* directory naming")
+    return resolved_name or None
+
+
 def _dict_of_dict(value: Any) -> dict[str, dict[str, Any]]:
     """Normalize unknown mapping-like payload into ``dict[str, dict]``."""
     return {str(k): dict(v) for k, v in dict(value).items()}
+
+
+_NAME_SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _agent_name_slug(agent_name: str | None) -> str:
+    """Build stable lowercase ASCII slug from display name."""
+    if agent_name is None:
+        return ""
+    text = str(agent_name).strip().lower()
+    if not text:
+        return ""
+    slug = _NAME_SLUG_NON_ALNUM.sub("-", text).strip("-")
+    if not slug:
+        return "agent"
+    return slug[:48].strip("-")
+
+
+def _agent_dirname(agent_id: str, agent_name: str | None) -> str:
+    """Build canonical on-disk agent folder name."""
+    resolved_id = _normalized_text(agent_id)
+    name_slug = _agent_name_slug(agent_name)
+    if not name_slug:
+        return resolved_id
+    prefix = "agent-"
+    if resolved_id.startswith(prefix) and len(resolved_id) > len(prefix):
+        suffix = resolved_id[len(prefix) :]
+        return f"{prefix}{name_slug}-{suffix}"
+    return f"{resolved_id}-{name_slug}"

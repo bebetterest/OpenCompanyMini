@@ -113,7 +113,12 @@ class OrchestratorTelemetryMixin:
             "context_summary": str(metadata.get("context_summary", "")),
             "result": json_ready(result),
         }
-        self.storage.append_agent_context_compression(self.session.id, agent.id, payload)
+        self.storage.append_agent_context_compression(
+            self.session.id,
+            agent.id,
+            payload,
+            agent_name=agent.name,
+        )
         self._append_runtime_log(
             level="INFO",
             message="context_compression_recorded",
@@ -129,7 +134,21 @@ class OrchestratorTelemetryMixin:
         """Persist one per-agent LLM request payload and return sequence id."""
         if self.session is None:
             return 0
-        sequence = self.storage.append_agent_llm_call_request(self.session.id, agent.id, payload)
+        sequence = self.storage.append_agent_llm_call_request(
+            self.session.id,
+            agent.id,
+            payload,
+            agent_name=agent.name,
+        )
+        self._log_event(
+            agent,
+            "llm_call_request_recorded",
+            {
+                "sequence": sequence,
+                "protocol_attempt": payload.get("protocol_attempt"),
+                "protocol_max_attempts": payload.get("protocol_max_attempts"),
+            },
+        )
         self._append_runtime_log(
             level="INFO",
             message="llm_request_recorded",
@@ -142,7 +161,22 @@ class OrchestratorTelemetryMixin:
         """Persist one per-agent LLM response payload for a request sequence."""
         if self.session is None:
             return
-        self.storage.append_agent_llm_call_response(self.session.id, agent.id, sequence, payload)
+        self.storage.append_agent_llm_call_response(
+            self.session.id,
+            agent.id,
+            sequence,
+            payload,
+            agent_name=agent.name,
+        )
+        self._log_event(
+            agent,
+            "llm_call_response_recorded",
+            {
+                "sequence": max(1, int(sequence)),
+                "ok": bool(payload.get("ok", False)),
+                "parse_error": payload.get("parse_error"),
+            },
+        )
         self._append_runtime_log(
             level="INFO",
             message="llm_response_recorded",

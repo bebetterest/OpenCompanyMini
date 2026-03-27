@@ -57,6 +57,20 @@ def tool_definitions_for_role(
                         limit_schema["minimum"] = 1
                         limit_schema["maximum"] = int(config.runtime.tools.list_max_limit)
                         limit_schema["default"] = int(config.runtime.tools.list_default_limit)
+                if isinstance(properties, dict) and name == "shell":
+                    _apply_timeout_default(
+                        properties=properties,
+                        key="timeout_seconds",
+                        default=float(config.runtime.tools.shell_timeout_seconds),
+                        minimum=1.0,
+                    )
+                if isinstance(properties, dict) and name == "wait_run":
+                    _apply_timeout_default(
+                        properties=properties,
+                        key="timeout_seconds",
+                        default=float(config.runtime.tools.wait_run_timeout_seconds),
+                        minimum=0.0,
+                    )
                 if name == "finish":
                     _apply_finish_schema(params=params, role=role_name)
         resolved.append(item)
@@ -74,6 +88,15 @@ def _apply_finish_schema(*, params: dict[str, Any], role: str) -> None:
         status_schema["enum"] = allowed
     if role == AgentRole.ROOT.value:
         properties.pop("next_recommendation", None)
+
+
+def _apply_timeout_default(*, properties: dict[str, Any], key: str, default: float, minimum: float) -> None:
+    """Set timeout schema defaults from runtime config."""
+    timeout_schema = properties.get(key)
+    if not isinstance(timeout_schema, dict):
+        return
+    timeout_schema["default"] = float(default)
+    timeout_schema["minimum"] = float(minimum)
 
 
 def parse_list_limit(value: Any, *, config: OPMTrainConfig) -> int:

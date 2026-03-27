@@ -105,8 +105,10 @@ async def test_stream_chat_sends_tool_fields_and_parses_calls() -> None:
     assert result.content == ""
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0]["id"] == "call_1"
-    assert result.tool_calls[0]["name"] == "shell"
-    assert result.tool_calls[0]["arguments_json"] == '{"command":"echo hi"}'
+    assert result.tool_calls[0]["type"] == "function"
+    assert result.tool_calls[0]["function"]["name"] == "shell"
+    assert result.tool_calls[0]["function"]["arguments"] == '{"command":"echo hi"}'
+    assert set(result.tool_calls[0].keys()) == {"id", "type", "function"}
 
     payload = FakeAsyncClient.last_request["json"]  # type: ignore[index]
     assert payload["tools"][0]["function"]["name"] == "shell"  # type: ignore[index]

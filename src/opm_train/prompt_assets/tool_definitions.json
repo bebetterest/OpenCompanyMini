@@ -9,7 +9,7 @@
         "properties": {
           "command": {"type": "string", "description": "Shell command to execute."},
           "cwd": {"type": "string", "description": "Workspace-relative directory.", "default": "."},
-          "timeout_seconds": {"type": "number", "description": "Command timeout in seconds.", "minimum": 1, "maximum": 600},
+          "timeout_seconds": {"type": "number", "description": "Command timeout in seconds.", "minimum": 1, "maximum": 600, "default": 60},
           "blocking": {"type": "boolean", "description": "Wait for completion before returning.", "default": true}
         },
         "required": ["command"]
@@ -128,7 +128,7 @@
         "type": "object",
         "properties": {
           "run_id": {"type": "string", "description": "Tool run id."},
-          "timeout_seconds": {"type": "number", "description": "Optional wait timeout."}
+          "timeout_seconds": {"type": "number", "description": "Wait timeout in seconds. Use 0 to wait without timeout.", "minimum": 0, "default": 0}
         },
         "required": ["run_id"]
       }

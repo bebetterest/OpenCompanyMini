@@ -16,7 +16,10 @@ class AgentToolMixin:
 
     async def _tool_spawn_agent(self, run: ToolRun, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:
         """Create child worker agent and optionally wait for child completion."""
-        self._enforce_spawn_capacity(agent)
+        try:
+            self._enforce_spawn_capacity(agent)
+        except ValueError as exc:
+            return self._spawn_rejected_result(run=run, agent=agent, error_message=str(exc))
         instruction, name = self._spawn_request(action)
         child = self._build_child_agent(parent=agent, instruction=instruction, name=name)
         self._register_spawned_child(parent=agent, child=child, run=run)
@@ -68,6 +71,42 @@ class AgentToolMixin:
             raise ValueError("max_children_per_agent limit reached")
         if self._active_agent_count() >= self.config.runtime.limits.max_active_agents:
             raise ValueError("max_active_agents limit reached")
+
+    def _spawn_rejected_result(self, *, run: ToolRun, agent: AgentNode, error_message: str) -> dict[str, Any]:
+        """Return one structured non-throwing spawn rejection payload."""
+        code = "spawn_capacity_limited"
+        message = str(error_message).strip() or "spawn_agent rejected due to runtime capacity limits"
+        if "max_children_per_agent" in message:
+            code = "max_children_per_agent_limit_reached"
+        elif "max_active_agents" in message:
+            code = "max_active_agents_limit_reached"
+        result = {
+            "status": "rejected",
+            "child_agent_id": None,
+            "tool_run_id": run.id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+            "capacity": {
+                "active_agents": self._active_agent_count(),
+                "max_active_agents": int(self.config.runtime.limits.max_active_agents),
+                "children_of_parent": len(agent.children),
+                "max_children_per_agent": int(self.config.runtime.limits.max_children_per_agent),
+            },
+        }
+        self._log_event(
+            agent,
+            "spawn_rejected",
+            {
+                "tool_run_id": run.id,
+                "reason": dict(result["error"]),
+                "capacity": dict(result["capacity"]),
+            },
+        )
+        # Keep direct handler calls deterministic; _execute_tool_action will skip re-completion.
+        self._complete_tool_run(run, result=result)
+        return result
 
     def _active_agent_count(self) -> int:
         """Count agents that have not yet reached a terminal state."""

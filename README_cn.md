@@ -51,6 +51,7 @@ opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency
 opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
 opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_model> [--steps 6] [--batch-size 8] [--learning-rate 1e-4]
+opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] --mode raw|sft [--output <path>]
 ```
 
 常用参数：
@@ -82,23 +83,26 @@ opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_mo
 - 移除休眠状态与字段：`AgentStatus.waiting`、`ToolRun.parent_run_id`。
 - 移除未使用的运行时跟踪与工具函数：`tool_run_owner_agent`、`stable_json_dumps`。
 - 保留 `runtime.tools.shell_inline_wait_seconds` 作为 shell 内联返回阈值。
-- 快照写入版本更新为 `schema_version = 3`（本轮瘦身不保证旧快照兼容）。
+- 快照写入版本更新为 `schema_version = 4`（本轮瘦身不保证旧快照兼容）。
 
 ## 运行时行为更新
 
 - 当当前代理仍有自身未终态 tool run 时，`finish` 会被拒绝（不是直接失败）；工具结果包含 `finish_rejected` 与 `unfinished_tool_runs`。
 - `resume` 对不可恢复的未终态 tool run 记为 `abandoned`，不再记为 `failed`。
 - `doctor` 新增工具契约检查输出 `tool_contract_ok` 与 `tool_contract_issues`；`ready_for_real_run` 需要工具契约一致。
+- 工具/动作执行错误（如未知 `agent_id`、缺失工具 `type`、或工具名未启用）不再通过抛异常直接终止 agent loop；运行时会记录错误、将 tool run 标记为 failed，并返回结构化错误负载（`error.code` / `error.type` / `error.message`）。
+- `shell` 与 `wait_run` 的默认超时现由 `runtime.tools.shell_timeout_seconds` 与 `runtime.tools.wait_run_timeout_seconds` 统一配置（动作内 `timeout_seconds` 仍可覆盖）；超时返回会包含超时上下文（`timed_out`、`timeout_seconds`）。
 
 ## 运行数据
 
 默认写入：
 
 - `.opm_train/sessions/<session_id>/events.jsonl`
+- `.opm_train/sessions/<session_id>/turns.jsonl`
 - `.opm_train/sessions/<session_id>/state_snapshot.json`
-- `.opm_train/sessions/<session_id>/agents/<agent_id>/llm_calls/<index>_request.json`
-- `.opm_train/sessions/<session_id>/agents/<agent_id>/llm_calls/<index>_response.json`
-- `.opm_train/sessions/<session_id>/agents/<agent_id>/context_compressions/<index>.json`
+- `.opm_train/sessions/<session_id>/agents/<agent_folder>/llm_calls/<index>_request.json`
+- `.opm_train/sessions/<session_id>/agents/<agent_folder>/llm_calls/<index>_response.json`
+- `.opm_train/sessions/<session_id>/agents/<agent_folder>/context_compressions/<index>.json`
 - `.opm_train/sessions/<session_id>/logs/runtime.log`
 - `.opm_train/sessions/<session_id>/logs/errors.jsonl`
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl`（启用 `--timer` 时写入）
@@ -111,8 +115,25 @@ opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_mo
 `llm_calls/*_request.json` 与 `*_response.json` 中会记录统一推理元数据：
 `inference_provider`、`inference_endpoint`、`inference_model`、`inference_parameters`（如 `temperature`、`max_tokens`、工具调用开关）。
 
+`<agent_folder>` 默认采用 `agent-<name_slug>-<agent_id_suffix>`（例如 `agent-tester-08277a53f952`）。
+
 `events.jsonl` 是用于分析/训练的规范原始轨迹日志。
 在 `resume` 前，运行时会严格校验 snapshot 与 event-tail（`seq` 连续且数量一致）。
+
+`turns.jsonl` 是按 agent step 组织的轮次索引。每行包含：
+`turn_id`、`agent_id`、`step`、`event_seq_start/end`、`attempts`、`final_attempt`、`actions`、`action_results`、`finish_payload`、`step_error`。
+
+`export` 支持按范围导出：
+
+- session 级：`--session-id <id> --mode raw|sft`
+- agent 级：`--session-id <id> --agent-id <id> --mode raw|sft`
+- agent+step 级：`--session-id <id> --agent-id <id> --step <n> --mode raw|sft`
+
+约束：
+
+- `--step` 必须搭配 `--agent-id`。
+- `--mode sft` 输出 OpenAI-messages 风格样本，只使用每轮最终成功协议尝试。
+- 仅支持快照版本 `schema_version >= 4` 的会话导出（旧会话会被拒绝）。
 
 ## SFT 工作流
 

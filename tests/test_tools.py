@@ -40,6 +40,23 @@ def test_tool_definitions_list_limit_uses_runtime_config() -> None:
     assert limit_schema["maximum"] == 81
 
 
+def test_tool_definitions_timeout_defaults_use_runtime_config() -> None:
+    config = OPMTrainConfig()
+    config.runtime.tools.shell_timeout_seconds = 91
+    config.runtime.tools.wait_run_timeout_seconds = 2.5
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
+    shell_tool = _tool_by_name(tools, "shell")
+    shell_timeout = shell_tool["function"]["parameters"]["properties"]["timeout_seconds"]  # type: ignore[index]
+    assert shell_timeout["default"] == 91.0
+    assert shell_timeout["minimum"] == 1.0
+
+    wait_tool = _tool_by_name(tools, "wait_run")
+    wait_timeout = wait_tool["function"]["parameters"]["properties"]["timeout_seconds"]  # type: ignore[index]
+    assert wait_timeout["default"] == 2.5
+    assert wait_timeout["minimum"] == 0.0
+
+
 def test_validate_finish_action_worker_requires_next_recommendation_on_failed() -> None:
     error = validate_finish_action(
         AgentRole.WORKER,

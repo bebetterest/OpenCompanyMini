@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from opm_train.batch_runner import BatchRunConfig, OrchestratorFactory, run_batch
-from opm_train.config import PROVIDER_PROFILE_NAMES
+from opm_train.config import OPMTrainConfig, PROVIDER_PROFILE_NAMES
 from opm_train.data import list_dataset_adapters
 from opm_train.diagnostics import build_doctor_payload
 from opm_train.llm import ChatResult
 from opm_train.orchestrator import RuntimeOrchestrator, default_app_dir
 from opm_train.sft import SFTRunConfig, list_sft_backends, run_sft
+from opm_train.storage import SessionStorage
+from opm_train.trajectory import ExportSchemaError, export_trajectory
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
     sft_parser.add_argument("--sample-max-tokens", type=int, default=64, help="Max tokens for optional post-train sample")
     sft_parser.add_argument("--sample-temperature", type=float, default=0.0, help="Temperature for optional post-train sample")
     sft_parser.add_argument("--run-id", default=None, help="Optional stable SFT run id")
+
+    export_parser = subparsers.add_parser("export", help="Export session trajectory as raw or SFT payload")
+    _add_common_path_args(export_parser)
+    export_parser.add_argument("--session-id", required=True, help="Session id to export")
+    export_parser.add_argument("--agent-id", default=None, help="Optional target agent id for scoped export")
+    export_parser.add_argument("--step", type=int, default=None, help="Optional step number (requires --agent-id)")
+    export_parser.add_argument("--mode", required=True, choices=["raw", "sft"], help="Export mode")
+    export_parser.add_argument("--output", default=None, help="Optional output path (json for raw, jsonl for sft)")
 
     return parser
 
@@ -209,6 +219,55 @@ async def _run_async(args: argparse.Namespace) -> int:
     """Dispatch CLI command and print compact JSON result payloads."""
     app_dir = Path(args.app_dir).resolve() if args.app_dir else default_app_dir()
     project_dir = Path(args.project_dir).resolve()
+    if args.command == "export":
+        if args.step is not None and not str(args.agent_id or "").strip():
+            raise ValueError("--step requires --agent-id")
+        if args.step is not None and int(args.step) <= 0:
+            raise ValueError("--step must be a positive integer")
+        runtime_config = OPMTrainConfig.load(app_dir)
+        storage = SessionStorage(app_dir=app_dir, data_dir_name=runtime_config.project.data_dir)
+        try:
+            payload = export_trajectory(
+                storage=storage,
+                session_id=str(args.session_id),
+                mode=str(args.mode),
+                agent_id=getattr(args, "agent_id", None),
+                step=getattr(args, "step", None),
+            )
+        except ExportSchemaError as exc:
+            raise ValueError(str(exc)) from exc
+
+        output_path = Path(str(args.output)).resolve() if getattr(args, "output", None) else None
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if args.mode == "raw":
+                output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                exported_count = len((payload or {}).get("turns", [])) if isinstance(payload, dict) else 0
+            else:
+                rows = payload if isinstance(payload, list) else []
+                with output_path.open("w", encoding="utf-8") as handle:
+                    for row in rows:
+                        handle.write(json.dumps(row, ensure_ascii=False))
+                        handle.write("\n")
+                exported_count = len(rows)
+            print(
+                json.dumps(
+                    {
+                        "session_id": str(args.session_id),
+                        "mode": str(args.mode),
+                        "agent_id": getattr(args, "agent_id", None),
+                        "step": getattr(args, "step", None),
+                        "output_path": str(output_path),
+                        "count": int(exported_count),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
     if args.command == "sft":
         sft_output = run_sft(
             SFTRunConfig(

@@ -23,7 +23,10 @@ class ShellToolMixin:
         cwd = cwd.resolve()
         if self.project_dir not in [cwd, *cwd.parents]:
             raise ValueError("shell cwd escapes project directory")
-        timeout_seconds = float(action.get("timeout_seconds") or 60.0)
+        timeout_seconds = _parse_shell_timeout_seconds(
+            action.get("timeout_seconds"),
+            default=float(self.config.runtime.tools.shell_timeout_seconds),
+        )
         inline_wait_seconds = max(0.0, float(self.config.runtime.tools.shell_inline_wait_seconds))
         blocking = run.blocking
         stdout_parts: list[str] = []
@@ -36,6 +39,7 @@ class ShellToolMixin:
                 "command": command,
                 "cwd": str(cwd),
                 "pid": pid,
+                "timeout_seconds": timeout_seconds,
                 "exit_code": exit_code,
                 "stdout": "".join(stdout_parts),
                 "stderr": "".join(stderr_parts),
@@ -52,58 +56,106 @@ class ShellToolMixin:
 
         async def worker() -> dict[str, Any]:
             nonlocal pid
-            process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            pid = process.pid
-            publish()
-
-            async def read_stream(stream: asyncio.StreamReader | None, sink: list[str]) -> None:
-                if stream is None:
-                    return
-                while True:
-                    chunk = await stream.read(4096)
-                    if not chunk:
-                        return
-                    sink.append(chunk.decode("utf-8", errors="replace"))
-                    publish()
-
-            stdout_task = asyncio.create_task(read_stream(process.stdout, stdout_parts), name=f"shell-stdout:{run.id}")
-            stderr_task = asyncio.create_task(read_stream(process.stderr, stderr_parts), name=f"shell-stderr:{run.id}")
+            process: asyncio.subprocess.Process | None = None
+            stdout_task: asyncio.Task[Any] | None = None
+            stderr_task: asyncio.Task[Any] | None = None
             try:
-                await asyncio.wait_for(process.wait(), timeout=max(1.0, timeout_seconds))
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=str(cwd),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                pid = process.pid
+                publish()
+
+                async def read_stream(stream: asyncio.StreamReader | None, sink: list[str]) -> None:
+                    if stream is None:
+                        return
+                    while True:
+                        chunk = await stream.read(4096)
+                        if not chunk:
+                            return
+                        sink.append(chunk.decode("utf-8", errors="replace"))
+                        publish()
+
+                stdout_task = asyncio.create_task(read_stream(process.stdout, stdout_parts), name=f"shell-stdout:{run.id}")
+                stderr_task = asyncio.create_task(read_stream(process.stderr, stderr_parts), name=f"shell-stderr:{run.id}")
+                await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=False)
                 result = publish(exit_code=int(process.returncode or 0))
                 self._complete_tool_run(run, result=result)
                 return result
             except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-                publish(exit_code=int(process.returncode or -1), timed_out=True)
-                self._fail_tool_run(run, error="shell command timed out")
-                raise ValueError("shell command timed out")
-            except asyncio.CancelledError:
-                with suppress(ProcessLookupError):
+                if process is not None:
                     process.kill()
-                await process.wait()
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                    await process.wait()
+                if stdout_task is not None and stderr_task is not None:
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                publish(exit_code=int(process.returncode or -1) if process is not None else -1, timed_out=True)
+                timeout_error = f"shell command timed out after {timeout_seconds:g}s"
+                self._fail_tool_run(run, error=timeout_error)
+                raise ValueError(timeout_error)
+            except asyncio.CancelledError:
+                if process is not None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                    await process.wait()
+                if stdout_task is not None and stderr_task is not None:
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
                 if run.status.value not in TERMINAL_TOOL_RUN_STATUSES:
-                    publish(exit_code=int(process.returncode or -1))
+                    publish(exit_code=int(process.returncode or -1) if process is not None else -1)
                     self._cancel_tool_run_obj(run, reason="shell command cancelled")
                 raise
+            except Exception:
+                if process is not None and process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                    await process.wait()
+                if stdout_task is not None and stderr_task is not None:
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                publish(exit_code=int(process.returncode or -1) if process is not None else -1)
+                raise
+
+        task_observed = False
+
+        def _consume_task_exception(done_task: asyncio.Task[Any]) -> None:
+            """Consume unobserved background exceptions and keep run state consistent."""
+            nonlocal task_observed
+            with suppress(asyncio.CancelledError):
+                exc = done_task.exception()
+                if exc is None or task_observed:
+                    return
+                if run.status.value not in TERMINAL_TOOL_RUN_STATUSES:
+                    publish(exit_code=-1)
+                    self._fail_tool_run(run, error=str(exc))
+                agent = self.agents.get(run.agent_id) if isinstance(getattr(self, "agents", None), dict) else None
+                self._record_exception(
+                    stage="shell_task",
+                    exc=exc,
+                    agent=agent,
+                    payload={
+                        "tool_name": "shell",
+                        "tool_run_id": run.id,
+                        "action": json_ready(action),
+                    },
+                )
+                self._persist_snapshot()
 
         task = asyncio.create_task(worker(), name=f"shell:{run.id}")
+        task.add_done_callback(_consume_task_exception)
         self.tool_tasks[run.id] = task
         if not blocking or inline_wait_seconds <= 0.0:
             return _running_payload(run_id=run.id, result=run.result, inline_wait_seconds=inline_wait_seconds)
         try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=inline_wait_seconds)
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=inline_wait_seconds)
+            task_observed = True
+            return result
         except asyncio.TimeoutError:
             return _running_payload(run_id=run.id, result=run.result, inline_wait_seconds=inline_wait_seconds)
+        except Exception:
+            task_observed = True
+            raise
 
 
 def _running_payload(*, run_id: str, result: dict[str, Any] | None, inline_wait_seconds: float) -> dict[str, Any]:
@@ -117,3 +169,15 @@ def _running_payload(*, run_id: str, result: dict[str, Any] | None, inline_wait_
     if inline_wait_seconds > 0:
         payload["inline_wait_seconds"] = inline_wait_seconds
     return payload
+
+
+def _parse_shell_timeout_seconds(value: Any, *, default: float) -> float:
+    """Parse shell timeout from action payload with config default fallback."""
+    raw_seconds = default if value is None else value
+    try:
+        seconds = float(raw_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("shell timeout_seconds must be numeric") from exc
+    if seconds < 1.0:
+        raise ValueError("shell timeout_seconds must be >= 1")
+    return seconds

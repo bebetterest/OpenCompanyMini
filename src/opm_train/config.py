@@ -164,6 +164,8 @@ class RuntimeToolsConfig:
     worker_tools: list[str] = field(default_factory=_default_runtime_tool_names)
     list_default_limit: int = 20
     list_max_limit: int = 200
+    shell_timeout_seconds: float = 60.0
+    wait_run_timeout_seconds: float = 0.0
     shell_inline_wait_seconds: float = 8.0
 
     def tool_names_for_role(self, role: str) -> list[str]:
@@ -298,6 +300,16 @@ class OPMTrainConfig:
             worker_tools=_as_str_list(payload.get("worker_tools"), current.worker_tools),
             list_default_limit=_as_int(payload.get("list_default_limit"), current.list_default_limit, minimum=1),
             list_max_limit=_as_int(payload.get("list_max_limit"), current.list_max_limit, minimum=1),
+            shell_timeout_seconds=_as_float(
+                payload.get("shell_timeout_seconds"),
+                current.shell_timeout_seconds,
+                minimum=1.0,
+            ),
+            wait_run_timeout_seconds=_as_float(
+                payload.get("wait_run_timeout_seconds"),
+                current.wait_run_timeout_seconds,
+                minimum=0.0,
+            ),
             shell_inline_wait_seconds=_as_float(
                 payload.get("shell_inline_wait_seconds"),
                 current.shell_inline_wait_seconds,

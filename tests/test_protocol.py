@@ -20,8 +20,11 @@ def test_normalize_tool_calls_parses_arguments() -> None:
         [
             {
                 "id": "call-1",
-                "name": "shell",
-                "arguments_json": "{\"command\":\"echo hi\"}",
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "arguments": "{\"command\":\"echo hi\"}",
+                },
             }
         ]
     )
@@ -32,3 +35,38 @@ def test_normalize_tool_calls_parses_arguments() -> None:
             "command": "echo hi",
         }
     ]
+
+
+def test_normalize_tool_calls_accepts_openai_compatible_shape() -> None:
+    calls = normalize_tool_calls(
+        [
+            {
+                "id": "call-2",
+                "type": "function",
+                "function": {
+                    "name": "wait_time",
+                    "arguments": "{\"seconds\":0}",
+                },
+            }
+        ]
+    )
+    assert calls == [
+        {
+            "type": "wait_time",
+            "_tool_call_id": "call-2",
+            "seconds": 0,
+        }
+    ]
+
+
+def test_normalize_tool_calls_rejects_legacy_shape() -> None:
+    with pytest.raises(ProtocolError, match="type must be 'function'"):
+        normalize_tool_calls(
+            [
+                {
+                    "id": "call-legacy",
+                    "name": "wait_time",
+                    "arguments_json": "{\"seconds\":0}",
+                }
+            ]
+        )

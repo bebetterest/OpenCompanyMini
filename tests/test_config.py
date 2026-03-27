@@ -14,6 +14,8 @@ def test_load_runtime_tools_shell_inline_wait_seconds() -> None:
                 [
                     "[runtime.tools]",
                     "list_default_limit = 33",
+                    "shell_timeout_seconds = 75",
+                    "wait_run_timeout_seconds = 4.5",
                     "shell_inline_wait_seconds = 5.5",
                 ]
             ),
@@ -21,13 +23,19 @@ def test_load_runtime_tools_shell_inline_wait_seconds() -> None:
         )
         config = OPMTrainConfig.load(app_dir)
         assert config.runtime.tools.list_default_limit == 33
+        assert config.runtime.tools.shell_timeout_seconds == 75.0
+        assert config.runtime.tools.wait_run_timeout_seconds == 4.5
         assert config.runtime.tools.shell_inline_wait_seconds == 5.5
 
 
 def test_snapshot_includes_shell_inline_wait_seconds() -> None:
     config = OPMTrainConfig()
+    config.runtime.tools.shell_timeout_seconds = 22.0
+    config.runtime.tools.wait_run_timeout_seconds = 3.0
     config.runtime.tools.shell_inline_wait_seconds = 3.25
     tools_snapshot = config.as_snapshot()["runtime"]["tools"]
+    assert tools_snapshot["shell_timeout_seconds"] == 22.0
+    assert tools_snapshot["wait_run_timeout_seconds"] == 3.0
     assert tools_snapshot["shell_inline_wait_seconds"] == 3.25
 
 
