@@ -1,5 +1,20 @@
 # Progress
 
+## 2026-03-29
+
+- Extended `opm-train batch-run` with `--dataset openreward` mode, including OpenReward selectors/options: `--environment`, `--split`, `--task-index`, `--start`, `--stop`, `--variant`, `--base-url`, `--openreward-tool-format`, and `--max-steps`.
+- Added CLI validation rules for OpenReward mode (`--environment` required, `--task-index` mutually exclusive with `--start/--stop`, `--input` still required for non-OpenReward datasets, `--max-steps` must be positive).
+- Added OpenReward execution backend in `batch_runner`: task selection via `list_tasks/get_task/get_task_range`, session tool loop via `session/call_tool`, OpenAI-compatible model turns, and deterministic stop conditions (`finished`, no tool calls, step budget).
+- Added provider-aware default tool format selection (`openrouter` profile -> `openrouter`; others -> `openai`) with explicit override support.
+- Added OpenReward-specific artifacts and metrics:
+  - `.opm_train/batches/<batch_id>/openreward_results.jsonl` (`environment/split/variant/task_key/task_index/reward_total/finished/tool_calls/turns/session_status/error`).
+  - `.opm_train/batches/<batch_id>/openreward_summary.json` (`total/completed/finished/failed/total_reward/avg_reward`).
+- Added OpenReward resume support with stable per-task keys (prefer `task_id`, fallback `task_index`/order) while preserving existing batch-run behavior for `gsm8k/simple_math/mixed`.
+- Added optional dependency extra `.[openreward]`, updated README/README_cn with OfficeQA examples and generic environment-switching commands, and expanded test coverage for OpenReward backend/CLI argument contracts and outputs.
+- Extended OpenReward selection with mixed selectors via repeatable `--task-spec` (`<split>` or `<split>:<start>:<stop>`), allowing one batch to combine multiple splits and ranges.
+- Added mixed-selector validation (`--task-spec` mutually exclusive with legacy `--task-index` / `--start` / `--stop`) and tests for multi-split/range expansion.
+- Hardened OpenReward SDK compatibility: environment resolution now prioritizes explicit `variant` selectors, and client construction retries `api_key/base_url` argument combinations before fallback.
+
 ## 2026-03-25
 
 - Changed `spawn_agent` capacity behavior (`max_active_agents` / `max_children_per_agent`): runtime now returns a structured `status: rejected` payload to the caller agent instead of raising a tool execution exception, and records the spawn tool run as `completed` with rejection details.

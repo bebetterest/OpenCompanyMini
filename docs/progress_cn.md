@@ -1,5 +1,20 @@
 # 进度
 
+## 2026-03-29
+
+- 为 `opm-train batch-run` 扩展 `--dataset openreward` 模式，新增 OpenReward 参数：`--environment`、`--split`、`--task-index`、`--start`、`--stop`、`--variant`、`--base-url`、`--openreward-tool-format`、`--max-steps`。
+- 增加 OpenReward 模式参数校验：`--environment` 必填、`--task-index` 与 `--start/--stop` 互斥、非 OpenReward 数据集仍要求 `--input`、`--max-steps` 必须为正数。
+- 在 `batch_runner` 新增 OpenReward 执行后端：通过 `list_tasks/get_task/get_task_range` 选题，使用 `session/call_tool` 执行工具回合，并接入 OpenAI 兼容模型循环与确定性终止条件（`finished`、无工具调用、步数上限）。
+- 增加按 provider profile 的工具格式默认策略（`openrouter` -> `openrouter`，其余 -> `openai`），并支持参数显式覆盖。
+- 增加 OpenReward 专用产物与指标：
+  - `.opm_train/batches/<batch_id>/openreward_results.jsonl`（`environment/split/variant/task_key/task_index/reward_total/finished/tool_calls/turns/session_status/error`）。
+  - `.opm_train/batches/<batch_id>/openreward_summary.json`（`total/completed/finished/failed/total_reward/avg_reward`）。
+- 增加 OpenReward 续跑能力：以稳定任务键去重（优先 `task_id`，回退 `task_index`/顺序），同时保持 `gsm8k/simple_math/mixed` 现有路径行为不变。
+- 新增可选依赖 `.[openreward]`，同步更新 README/README_cn（含 OfficeQA 示例与其他环境切换示例），并补充 OpenReward backend/CLI 参数与输出的测试覆盖。
+- 新增 OpenReward 混合选择能力：通过可重复 `--task-spec`（`<split>` 或 `<split>:<start>:<stop>`）在一次批跑中组合多个 split 与区间任务。
+- 增加混合选择参数校验（`--task-spec` 与旧选择器 `--task-index` / `--start` / `--stop` 互斥）及多 split/区间展开测试。
+- 增强 OpenReward SDK 兼容性：环境解析优先使用显式 `variant` 选择，并在 client 初始化时对 `api_key/base_url` 组合做逐级回退重试。
+
 ## 2026-03-25
 
 - 调整 `spawn_agent` 容量上限行为（`max_active_agents` / `max_children_per_agent`）：运行时不再以工具执行异常直接抛错，而是向调用方 agent 返回结构化 `status: rejected` 结果；对应 spawn tool run 记为 `completed` 并带拒绝细节。

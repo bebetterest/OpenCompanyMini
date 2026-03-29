@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from opm_train.batch_runner import BatchRunConfig, OrchestratorFactory, run_batch
+from opm_train.batch_runner import BatchRunConfig, OpenRewardBatchSummary, OrchestratorFactory, run_batch
 from opm_train.config import OPMTrainConfig, PROVIDER_PROFILE_NAMES
 from opm_train.data import list_dataset_adapters
 from opm_train.diagnostics import build_doctor_payload
@@ -55,9 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument(
         "--dataset",
         required=True,
-        help=f"Dataset adapter name (available: {', '.join([*list_dataset_adapters(), 'mixed'])})",
+        help=f"Dataset adapter name (available: {', '.join([*list_dataset_adapters(), 'mixed', 'openreward'])})",
     )
-    batch_parser.add_argument("--input", required=True, help="Path to local dataset JSONL input")
+    batch_parser.add_argument("--input", required=False, help="Path to local dataset JSONL input")
     batch_parser.add_argument(
         "--adapter-key",
         default="adapter",
@@ -69,6 +69,61 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--resume", action="store_true", help="Resume from existing batch directory")
     batch_parser.add_argument("--smoke", action="store_true", help="Run batch with local smoke LLM (no API key)")
     batch_parser.add_argument("--model", default=None, help="Override model for this batch run")
+    batch_parser.add_argument(
+        "--environment",
+        default=None,
+        help="OpenReward environment name (required when --dataset openreward)",
+    )
+    batch_parser.add_argument(
+        "--split",
+        default="train",
+        help="OpenReward task split (default: train)",
+    )
+    batch_parser.add_argument(
+        "--task-spec",
+        action="append",
+        default=None,
+        help="Repeatable OpenReward selector: '<split>' or '<split>:<start>:<stop>'",
+    )
+    batch_parser.add_argument(
+        "--task-index",
+        type=int,
+        default=None,
+        help="OpenReward single task index selector (mutually exclusive with --start/--stop)",
+    )
+    batch_parser.add_argument(
+        "--start",
+        type=int,
+        default=None,
+        help="OpenReward range start index (inclusive)",
+    )
+    batch_parser.add_argument(
+        "--stop",
+        type=int,
+        default=None,
+        help="OpenReward range stop index (exclusive)",
+    )
+    batch_parser.add_argument(
+        "--variant",
+        default=None,
+        help="Optional OpenReward environment variant",
+    )
+    batch_parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Optional OpenReward base URL (for self-hosted/local environments)",
+    )
+    batch_parser.add_argument(
+        "--openreward-tool-format",
+        default=None,
+        help="Override OpenReward tool schema format (for example: openai/openrouter/anthropic/google)",
+    )
+    batch_parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=64,
+        help="Max model turns per OpenReward task loop (default: 64)",
+    )
 
     sft_parser = subparsers.add_parser("sft", help="Run supervised fine-tuning with pluggable backend")
     _add_common_path_args(sft_parser)
@@ -312,6 +367,9 @@ async def _run_async(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "batch-run":
+        _validate_batch_run_args(args)
+        input_arg = str(getattr(args, "input", "") or "").strip()
+        input_path = Path(input_arg) if input_arg else None
         batch_orchestrator_factory = _build_batch_orchestrator_factory(
             args=args,
             app_dir=app_dir,
@@ -320,7 +378,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         batch_output = await run_batch(
             BatchRunConfig(
                 dataset=str(args.dataset),
-                input_path=Path(str(args.input)),
+                input_path=input_path,
                 project_dir=project_dir,
                 app_dir=app_dir,
                 provider_profile=getattr(args, "provider_profile", None),
@@ -331,9 +389,38 @@ async def _run_async(args: argparse.Namespace) -> int:
                 batch_id=getattr(args, "batch_id", None),
                 resume=bool(getattr(args, "resume", False)),
                 adapter_key=str(getattr(args, "adapter_key", "adapter")),
+                environment=getattr(args, "environment", None),
+                split=str(getattr(args, "split", "train")),
+                task_index=getattr(args, "task_index", None),
+                start=getattr(args, "start", None),
+                stop=getattr(args, "stop", None),
+                variant=getattr(args, "variant", None),
+                base_url=getattr(args, "base_url", None),
+                openreward_tool_format=getattr(args, "openreward_tool_format", None),
+                max_steps=int(getattr(args, "max_steps", 64)),
+                task_specs=tuple(getattr(args, "task_spec", []) or ()),
             ),
             orchestrator_factory=batch_orchestrator_factory,
         )
+        if isinstance(batch_output.summary, OpenRewardBatchSummary):
+            print(
+                json.dumps(
+                    {
+                        "batch_id": batch_output.batch_id,
+                        "total": batch_output.summary.total,
+                        "completed": batch_output.summary.completed,
+                        "finished": batch_output.summary.finished,
+                        "failed": batch_output.summary.failed,
+                        "total_reward": batch_output.summary.total_reward,
+                        "avg_reward": batch_output.summary.avg_reward,
+                        "results_path": str(batch_output.results_path),
+                        "summary_path": str(batch_output.summary_path),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
         print(
             json.dumps(
                 {
@@ -403,6 +490,36 @@ def _build_batch_orchestrator_factory(
         return orchestrator
 
     return create
+
+
+def _validate_batch_run_args(args: argparse.Namespace) -> None:
+    """Validate batch-run argument combinations before dispatch."""
+    dataset = str(getattr(args, "dataset", "")).strip().lower()
+    input_value = str(getattr(args, "input", "") or "").strip()
+    is_openreward = dataset == "openreward"
+
+    if not is_openreward and not input_value:
+        raise ValueError("--input is required unless --dataset openreward")
+
+    if not is_openreward:
+        return
+
+    environment = str(getattr(args, "environment", "") or "").strip()
+    if not environment:
+        raise ValueError("--environment is required when --dataset openreward")
+
+    task_index = getattr(args, "task_index", None)
+    start = getattr(args, "start", None)
+    stop = getattr(args, "stop", None)
+    task_specs = [str(item).strip() for item in (getattr(args, "task_spec", None) or []) if str(item).strip()]
+    if task_index is not None and (start is not None or stop is not None):
+        raise ValueError("--task-index cannot be used with --start/--stop")
+    if task_specs and (task_index is not None or start is not None or stop is not None):
+        raise ValueError("--task-spec cannot be used with --task-index/--start/--stop")
+
+    max_steps = int(getattr(args, "max_steps", 64))
+    if max_steps <= 0:
+        raise ValueError("--max-steps must be a positive integer")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@
 conda env create -f environment.yml
 conda activate OpenCompany
 pip install -e ".[dev,sft]"
+# 可选：如需使用 OpenReward 批量环境接入（--dataset openreward）
+pip install -e ".[openreward]"
 
 # 2) 检查配置与环境
 opm-train doctor
@@ -50,6 +52,7 @@ opm-train doctor
 opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
+opm-train batch-run --dataset openreward --environment <owner/env> [--split train] [--task-index N | --start N --stop M | --task-spec <split> | --task-spec <split:start:stop>] [--variant <name>] [--base-url <url>] [--openreward-tool-format <fmt>] [--max-steps 64] [--concurrency 4] [--limit N] [--batch-id <id>] [--resume]
 opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_model> [--steps 6] [--batch-size 8] [--learning-rate 1e-4]
 opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] --mode raw|sft [--output <path>]
 ```
@@ -108,6 +111,8 @@ opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] 
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl`（启用 `--timer` 时写入）
 - `.opm_train/batches/<batch_id>/results.jsonl`（逐样本评测记录）
 - `.opm_train/batches/<batch_id>/summary.json`（汇总指标）
+- `.opm_train/batches/<batch_id>/openreward_results.jsonl`（OpenReward 逐任务记录）
+- `.opm_train/batches/<batch_id>/openreward_summary.json`（OpenReward 汇总指标）
 - `.opm_train/sft_runs/<run_id>/config.json`（解析后的运行配置与数据映射）
 - `.opm_train/sft_runs/<run_id>/metrics.jsonl`（逐 step 训练指标）
 - `.opm_train/sft_runs/<run_id>/result.json`（后端终态摘要）
@@ -240,6 +245,64 @@ PY
 - 示例：`{"adapter":"simple_math","id":"m2","question":"13*7","answer":"91"}`。
 - 运行时会按行路由到对应适配器，并在 `results.jsonl` 写入 `adapter_name`。
 
+`openreward` 数据模式：
+
+- 直接对接 OpenReward 环境（`AsyncOpenReward`），不依赖本地 JSONL 适配器。
+- 必填参数：`--environment <owner/environment>`（例如 `GeneralReasoning/OfficeQA`）。
+- 任务选择方式：
+  - 单任务：`--task-index <n>`
+  - 区间任务：`--start <n> --stop <m>`
+  - 全 split：不传选择器（默认 `train`）
+  - 混合选择（可重复）：`--task-spec <split>` 与/或 `--task-spec <split>:<start>:<stop>`
+  - `--task-spec` 不能和 `--task-index` 或 `--start/--stop` 同时使用
+- 可选路由参数：`--variant <name>` 与 `--base-url <url>`，用于多变体或自托管环境。
+- 工具 schema 格式按 provider profile 默认：
+  - `openrouter` -> `openrouter`
+  - `tinker` / `custom` -> `openai`
+  - 可用 `--openreward-tool-format` 覆盖。
+- 结果输出采用 OpenReward 专用奖励语义，产物文件：
+  - `openreward_results.jsonl`
+  - `openreward_summary.json`
+
+OfficeQA 单任务示例：
+
+```bash
+export OPENREWARD_API_KEY="<your_openreward_key>"
+export OPENROUTER_API_KEY="<your_openrouter_key>"
+
+opm-train batch-run \
+  --dataset openreward \
+  --environment GeneralReasoning/OfficeQA \
+  --split train \
+  --task-index 0 \
+  --provider-profile openrouter \
+  --model "deepseek/deepseek-v3.2"
+```
+
+其他环境区间任务示例：
+
+```bash
+opm-train batch-run \
+  --dataset openreward \
+  --environment GeneralReasoning/CTF \
+  --split train \
+  --start 0 \
+  --stop 10 \
+  --concurrency 4 \
+  --max-steps 64
+```
+
+OpenReward 混合选择示例（一次批跑包含多个 split/区间）：
+
+```bash
+opm-train batch-run \
+  --dataset openreward \
+  --environment GeneralReasoning/OfficeQA \
+  --task-spec train:0:20 \
+  --task-spec validation \
+  --concurrency 4
+```
+
 ## 数据集扩展流程
 
 1. 新增适配器
@@ -272,6 +335,7 @@ class MyDatasetAdapter(DatasetAdapter):
 - 实时写入 JSONL（每个样本完成即追加到 `results.jsonl`）。
 - 支持断点续跑（`--batch-id <id> --resume`），按 `(adapter_name, sample_id)` 跳过已完成样本并继续未完成部分。
 - 支持 `--smoke` 模式，无需外部 LLM API Key 即可跑通批量链路。
+- `openreward` 模式会写入奖励语义专用产物（`openreward_results.jsonl`、`openreward_summary.json`），并输出 `completed`/`finished`/`avg_reward` 等指标。
 
 `results.jsonl` 单行字段包括：
 

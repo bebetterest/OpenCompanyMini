@@ -23,6 +23,9 @@ dev = [
 sft = [
   "tinker",
 ]
+openreward = [
+  "openreward",
+]
 
 [project.scripts]
 opm-train = "opm_train.cli:main"

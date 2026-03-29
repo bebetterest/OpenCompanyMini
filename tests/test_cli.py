@@ -483,6 +483,237 @@ def test_batch_run_command_supports_mixed_dataset_mode(capsys, monkeypatch) -> N
         assert payload["total"] == 2
 
 
+def test_batch_run_command_openreward_requires_environment() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        with pytest.raises(ValueError, match="--environment is required"):
+            main(
+                [
+                    "batch-run",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(app_dir),
+                    "--dataset",
+                    "openreward",
+                ]
+            )
+
+
+def test_batch_run_command_rejects_task_index_with_range() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        with pytest.raises(ValueError, match="--task-index cannot be used with --start/--stop"):
+            main(
+                [
+                    "batch-run",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(app_dir),
+                    "--dataset",
+                    "openreward",
+                    "--environment",
+                    "GeneralReasoning/OfficeQA",
+                    "--task-index",
+                    "0",
+                    "--start",
+                    "0",
+                    "--stop",
+                    "10",
+                ]
+            )
+
+
+def test_batch_run_command_rejects_task_spec_with_task_index() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        with pytest.raises(ValueError, match="--task-spec cannot be used with --task-index/--start/--stop"):
+            main(
+                [
+                    "batch-run",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(app_dir),
+                    "--dataset",
+                    "openreward",
+                    "--environment",
+                    "GeneralReasoning/OfficeQA",
+                    "--task-spec",
+                    "train:0:10",
+                    "--task-index",
+                    "0",
+                ]
+            )
+
+
+def test_batch_run_command_non_openreward_still_requires_input() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        with pytest.raises(ValueError, match="--input is required unless --dataset openreward"):
+            main(
+                [
+                    "batch-run",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(app_dir),
+                    "--dataset",
+                    "gsm8k",
+                ]
+            )
+
+
+def test_batch_run_command_openreward_rejects_non_positive_max_steps() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        with pytest.raises(ValueError, match="--max-steps must be a positive integer"):
+            main(
+                [
+                    "batch-run",
+                    "--app-dir",
+                    str(app_dir),
+                    "--project-dir",
+                    str(app_dir),
+                    "--dataset",
+                    "openreward",
+                    "--environment",
+                    "GeneralReasoning/OfficeQA",
+                    "--max-steps",
+                    "0",
+                ]
+            )
+
+
+def test_batch_run_command_openreward_outputs_openreward_metrics(capsys, monkeypatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        batch_dir = app_dir / ".opm_train" / "batches" / "or-batch-1"
+        results_path = batch_dir / "openreward_results.jsonl"
+        summary_path = batch_dir / "openreward_summary.json"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        results_path.write_text("", encoding="utf-8")
+        summary_path.write_text("{}", encoding="utf-8")
+
+        async def _fake_run_batch(config, orchestrator_factory=None):
+            _ = orchestrator_factory
+            assert config.dataset == "openreward"
+            assert config.environment == "GeneralReasoning/OfficeQA"
+            assert config.task_index == 0
+            assert config.input_path is None
+            assert config.task_specs == ()
+            return batch_runner_module.BatchRunOutput(
+                batch_id="or-batch-1",
+                batch_dir=batch_dir,
+                results_path=results_path,
+                summary_path=summary_path,
+                summary=batch_runner_module.OpenRewardBatchSummary(
+                    total=1,
+                    completed=1,
+                    finished=1,
+                    failed=0,
+                    total_reward=1.0,
+                    avg_reward=1.0,
+                    output_paths={
+                        "openreward_results_jsonl": str(results_path),
+                        "openreward_summary_json": str(summary_path),
+                    },
+                ),
+            )
+
+        monkeypatch.setattr(cli_module, "run_batch", _fake_run_batch)
+
+        rc = main(
+            [
+                "batch-run",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(app_dir),
+                "--dataset",
+                "openreward",
+                "--environment",
+                "GeneralReasoning/OfficeQA",
+                "--task-index",
+                "0",
+            ]
+        )
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["batch_id"] == "or-batch-1"
+        assert payload["total"] == 1
+        assert payload["completed"] == 1
+        assert payload["finished"] == 1
+        assert payload["failed"] == 0
+        assert payload["total_reward"] == 1.0
+        assert payload["avg_reward"] == 1.0
+        assert payload["results_path"] == str(results_path)
+        assert payload["summary_path"] == str(summary_path)
+
+
+def test_batch_run_command_openreward_passes_task_specs(capsys, monkeypatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        batch_dir = app_dir / ".opm_train" / "batches" / "or-batch-spec"
+        results_path = batch_dir / "openreward_results.jsonl"
+        summary_path = batch_dir / "openreward_summary.json"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        results_path.write_text("", encoding="utf-8")
+        summary_path.write_text("{}", encoding="utf-8")
+
+        async def _fake_run_batch(config, orchestrator_factory=None):
+            _ = orchestrator_factory
+            assert config.dataset == "openreward"
+            assert config.environment == "GeneralReasoning/OfficeQA"
+            assert config.task_specs == ("train:0:2", "validation")
+            assert config.task_index is None
+            assert config.start is None
+            assert config.stop is None
+            return batch_runner_module.BatchRunOutput(
+                batch_id="or-batch-spec",
+                batch_dir=batch_dir,
+                results_path=results_path,
+                summary_path=summary_path,
+                summary=batch_runner_module.OpenRewardBatchSummary(
+                    total=2,
+                    completed=2,
+                    finished=2,
+                    failed=0,
+                    total_reward=2.0,
+                    avg_reward=1.0,
+                    output_paths={
+                        "openreward_results_jsonl": str(results_path),
+                        "openreward_summary_json": str(summary_path),
+                    },
+                ),
+            )
+
+        monkeypatch.setattr(cli_module, "run_batch", _fake_run_batch)
+
+        rc = main(
+            [
+                "batch-run",
+                "--app-dir",
+                str(app_dir),
+                "--project-dir",
+                str(app_dir),
+                "--dataset",
+                "openreward",
+                "--environment",
+                "GeneralReasoning/OfficeQA",
+                "--task-spec",
+                "train:0:2",
+                "--task-spec",
+                "validation",
+            ]
+        )
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["batch_id"] == "or-batch-spec"
+        assert payload["total"] == 2
+
+
 def test_sft_command_outputs_structured_payload(capsys, monkeypatch) -> None:
     with TemporaryDirectory() as temp_dir:
         app_dir = Path(temp_dir)

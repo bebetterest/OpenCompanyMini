@@ -20,6 +20,8 @@ You can verify the runtime end-to-end **without any external API key**:
 conda env create -f environment.yml
 conda activate OpenCompany
 pip install -e ".[dev,sft]"
+# Optional: OpenReward integration for batch-run --dataset openreward
+pip install -e ".[openreward]"
 
 # 2) Check environment/config
 opm-train doctor
@@ -50,6 +52,7 @@ opm-train doctor
 opm-train batch-run --dataset gsm8k --input <path/to/gsm8k.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset simple_math --input <path/to/simple_math.jsonl> [--concurrency 4] [--limit N] [--batch-id <id>] [--resume] [--smoke]
 opm-train batch-run --dataset mixed --input <path/to/mixed.jsonl> --adapter-key adapter [--batch-id <id>] [--resume]
+opm-train batch-run --dataset openreward --environment <owner/env> [--split train] [--task-index N | --start N --stop M | --task-spec <split> | --task-spec <split:start:stop>] [--variant <name>] [--base-url <url>] [--openreward-tool-format <fmt>] [--max-steps 64] [--concurrency 4] [--limit N] [--batch-id <id>] [--resume]
 opm-train sft --backend tinker --input <path/to/sft.jsonl> --base-model <base_model> [--steps 6] [--batch-size 8] [--learning-rate 1e-4]
 opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] --mode raw|sft [--output <path>]
 ```
@@ -108,6 +111,8 @@ By default, runtime data is written under:
 - `.opm_train/sessions/<session_id>/timers/module_timings.jsonl` (when `--timer` is enabled)
 - `.opm_train/batches/<batch_id>/results.jsonl` (per-sample evaluation records)
 - `.opm_train/batches/<batch_id>/summary.json` (aggregate metrics)
+- `.opm_train/batches/<batch_id>/openreward_results.jsonl` (per-task OpenReward records)
+- `.opm_train/batches/<batch_id>/openreward_summary.json` (OpenReward aggregate metrics)
 - `.opm_train/sft_runs/<run_id>/config.json` (resolved run config + dataset mapping)
 - `.opm_train/sft_runs/<run_id>/metrics.jsonl` (per-step training metrics)
 - `.opm_train/sft_runs/<run_id>/result.json` (terminal backend summary)
@@ -240,6 +245,64 @@ Note: the JSONL loader streams physical lines (instead of using `splitlines()`),
 - Example row: `{"adapter":"simple_math","id":"m2","question":"13*7","answer":"91"}`.
 - Runtime routes each row to its adapter and writes `adapter_name` into `results.jsonl`.
 
+`openreward` dataset mode:
+
+- Uses OpenReward environments directly (`AsyncOpenReward`) instead of local JSONL adapters.
+- Required argument: `--environment <owner/environment>` (for example `GeneralReasoning/OfficeQA`).
+- Task selection:
+  - Single task: `--task-index <n>`
+  - Task range: `--start <n> --stop <m>`
+  - Full split: omit all selectors (default split is `train`)
+  - Mixed selectors (repeatable): `--task-spec <split>` and/or `--task-spec <split>:<start>:<stop>`
+  - `--task-spec` cannot be combined with `--task-index` or `--start/--stop`
+- Optional environment routing: `--variant <name>` and `--base-url <url>` for multi-variant/self-hosted environments.
+- Tool schema format defaults by provider profile:
+  - `openrouter` profile -> `openrouter`
+  - `tinker` / `custom` profile -> `openai`
+  - Override with `--openreward-tool-format`.
+- Results/summary use OpenReward-specific fields (reward-based), persisted to:
+  - `openreward_results.jsonl`
+  - `openreward_summary.json`
+
+OfficeQA example (single task):
+
+```bash
+export OPENREWARD_API_KEY="<your_openreward_key>"
+export OPENROUTER_API_KEY="<your_openrouter_key>"
+
+opm-train batch-run \
+  --dataset openreward \
+  --environment GeneralReasoning/OfficeQA \
+  --split train \
+  --task-index 0 \
+  --provider-profile openrouter \
+  --model "deepseek/deepseek-v3.2"
+```
+
+OpenReward range example (other environments):
+
+```bash
+opm-train batch-run \
+  --dataset openreward \
+  --environment GeneralReasoning/CTF \
+  --split train \
+  --start 0 \
+  --stop 10 \
+  --concurrency 4 \
+  --max-steps 64
+```
+
+OpenReward mixed-selector example (multiple splits/ranges in one batch):
+
+```bash
+opm-train batch-run \
+  --dataset openreward \
+  --environment GeneralReasoning/OfficeQA \
+  --task-spec train:0:20 \
+  --task-spec validation \
+  --concurrency 4
+```
+
 ## Dataset Extension Workflow
 
 1. Add adapter
@@ -272,6 +335,7 @@ class MyDatasetAdapter(DatasetAdapter):
 - Realtime JSONL append (`results.jsonl` is written as each sample finishes).
 - Resume support (`--batch-id <id> --resume`) skips already completed `(adapter_name, sample_id)` and continues the rest.
 - Smoke mode (`--smoke`) runs batch without external LLM API keys.
+- `openreward` mode writes dedicated reward-based artifacts (`openreward_results.jsonl`, `openreward_summary.json`) and reports `completed`/`finished`/`avg_reward` metrics.
 
 `results.jsonl` rows include:
 
