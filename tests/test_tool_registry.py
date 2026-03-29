@@ -27,7 +27,7 @@ def test_tool_registry_contains_canonical_runtime_tools() -> None:
 def test_tool_registry_default_blocking_and_self_completing_contract() -> None:
     assert TOOL_REGISTRY["spawn_agent"].default_blocking is False
     assert TOOL_REGISTRY["shell"].default_blocking is True
-    assert SELF_COMPLETING_TOOL_ACTIONS == {"spawn_agent", "shell"}
+    assert SELF_COMPLETING_TOOL_ACTIONS == {"shell"}
 
 
 def test_tool_registry_executor_argument_binding() -> None:

@@ -180,6 +180,7 @@ class FinishRejectedThenWaitLLM:
                 }
             )
         elif self.root_calls == 2:
+            self.shell_run_id = str(tool_payload.get("tool_run_id", "")).strip()
             text = json.dumps(
                 {
                     "actions": [
@@ -193,11 +194,8 @@ class FinishRejectedThenWaitLLM:
             )
         elif self.root_calls == 3:
             self.saw_finish_rejection = bool(
-                tool_payload.get("accepted") is False and isinstance(tool_payload.get("unfinished_tool_runs"), list)
+                tool_payload.get("accepted") is False and str(tool_payload.get("error", "")).strip()
             )
-            unfinished = tool_payload.get("unfinished_tool_runs")
-            if isinstance(unfinished, list) and unfinished:
-                self.shell_run_id = str((unfinished[0] or {}).get("tool_run_id", "")).strip()
             text = json.dumps(
                 {
                     "actions": [
@@ -499,7 +497,7 @@ class CancelUnknownAgentLLM:
                 raw_events=[],
             )
         payload = _extract_last_tool_payload(kwargs["messages"])
-        self.saw_unknown_agent_error = str(payload.get("error_code", "")) == "unknown_agent_id"
+        self.saw_unknown_agent_error = "Cannot cancel agent agent-missing." in str(payload.get("error", ""))
         return ChatResult(
             content=json.dumps(
                 {
@@ -797,7 +795,7 @@ async def test_finish_is_rejected_until_agent_own_tool_runs_are_terminal() -> No
             if str(message.get("role", "")) == "tool" and str(message.get("content", "")).strip().startswith("{")
         ]
         assert any(
-            payload.get("accepted") is False and isinstance(payload.get("unfinished_tool_runs"), list)
+            payload.get("accepted") is False and str(payload.get("error", "")).strip()
             for payload in tool_payloads
             if isinstance(payload, dict)
         )
@@ -1255,7 +1253,7 @@ async def test_cancel_agent_cannot_cancel_root() -> None:
         assert len(cancel_runs) == 1
         assert cancel_runs[0].result is not None
         assert cancel_runs[0].result["cancel_agent_status"] is False
-        assert "cannot target the current root agent" in str(cancel_runs[0].result["error"])
+        assert "cannot target the current agent itself" in str(cancel_runs[0].result["error"])
 
 
 @pytest.mark.asyncio
@@ -1269,8 +1267,10 @@ async def test_cancel_agent_unknown_agent_id_returns_structured_error_without_fa
         assert llm.saw_unknown_agent_error is True
         cancel_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "cancel_agent"]
         assert len(cancel_runs) == 1
-        assert cancel_runs[0].status.value == "failed"
-        assert cancel_runs[0].error == "unknown agent_id: agent-missing"
+        assert cancel_runs[0].status.value == "completed"
+        assert cancel_runs[0].result is not None
+        assert cancel_runs[0].result["cancel_agent_status"] is False
+        assert cancel_runs[0].result["error"] == "Cannot cancel agent agent-missing."
 
 
 @pytest.mark.asyncio

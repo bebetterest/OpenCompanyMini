@@ -51,13 +51,25 @@ class AgentToolMixin:
         recursive = bool(action.get("recursive", True))
         if not target_id:
             raise ValueError("cancel_agent requires agent_id")
-        if target_id not in self.agents:
-            raise ValueError(f"unknown agent_id: {target_id}")
-        root_id = self.session.root_agent_id if self.session is not None else ""
-        if target_id == root_id:
+        requester = self.agents.get(run.agent_id)
+        if requester is not None and target_id == requester.id:
             result = {
                 "cancel_agent_status": False,
-                "error": "cancel_agent cannot target the current root agent.",
+                "error": "cancel_agent cannot target the current agent itself.",
+            }
+            self._complete_tool_run(run, result=result)
+            return result
+        if requester is not None and not self._is_descendant(requester.id, target_id):
+            result = {
+                "cancel_agent_status": False,
+                "error": f"Cannot cancel agent {target_id}.",
+            }
+            self._complete_tool_run(run, result=result)
+            return result
+        if target_id not in self.agents:
+            result = {
+                "cancel_agent_status": False,
+                "error": f"Cannot cancel agent {target_id}.",
             }
             self._complete_tool_run(run, result=result)
             return result
@@ -65,6 +77,28 @@ class AgentToolMixin:
         result = {"cancel_agent_status": bool(cancelled)}
         self._complete_tool_run(run, result=result)
         return result
+
+    def _is_descendant(self, parent_id: str, target_id: str) -> bool:
+        """Return whether target_id is inside parent_id's descendant tree."""
+        if not parent_id or not target_id or parent_id == target_id:
+            return False
+        parent = self.agents.get(parent_id)
+        if parent is None:
+            return False
+        stack = list(parent.children)
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current == target_id:
+                return True
+            node = self.agents.get(current)
+            if node is None:
+                continue
+            stack.extend(node.children)
+        return False
 
     def _enforce_spawn_capacity(self, agent: AgentNode) -> None:
         """Validate per-parent and global active-agent spawn limits."""

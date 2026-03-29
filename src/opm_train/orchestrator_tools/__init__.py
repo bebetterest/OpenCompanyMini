@@ -7,6 +7,7 @@ import inspect
 from typing import Any
 
 from opm_train.models import AgentNode, ToolRun, ToolRunStatus
+from opm_train.tools import visible_tool_names_for_agent
 from opm_train.utils import json_ready, utc_now
 
 from .agent_ops import AgentToolMixin
@@ -169,7 +170,7 @@ class OrchestratorToolingMixin(AgentToolMixin, QueryToolMixin, ShellToolMixin):
             "error": message,
             "error_code": code,
             "action": json_ready(action),
-            "available_tools": list(self.config.runtime.tools.tool_names_for_role(agent.role.value)),
+            "available_tools": list(visible_tool_names_for_agent(agent, config=self.config)),
         }
 
     async def _execute_tool_action(self, *, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:

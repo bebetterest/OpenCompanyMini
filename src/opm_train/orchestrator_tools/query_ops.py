@@ -342,7 +342,18 @@ class QueryToolMixin:
         if error:
             return {"wait_time_status": False, "error": error}
         seconds = float(action.get("seconds") or 0.0)
-        await asyncio.sleep(seconds)
+        timeout_seconds = max(0.0, float(self.config.runtime.tools.wait_run_timeout_seconds))
+        try:
+            if timeout_seconds > 0:
+                await asyncio.wait_for(asyncio.sleep(seconds), timeout=timeout_seconds)
+            else:
+                await asyncio.sleep(seconds)
+        except asyncio.TimeoutError:
+            return {
+                "wait_time_status": False,
+                "timed_out": True,
+                "timeout_seconds": timeout_seconds,
+            }
         return {"wait_time_status": True}
 
     async def _tool_list_mcp_servers(self, action: dict[str, Any]) -> dict[str, Any]:

@@ -5,9 +5,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from opm_train.config import OPMTrainConfig
-from opm_train.models import AgentRole
+from opm_train.models import AgentNode, AgentRole
 from opm_train.prompts import PromptLibrary, default_prompts_dir
-from opm_train.tools import runtime_tool_contract_issues, tool_definitions_for_role, validate_finish_action
+from opm_train.tools import (
+    runtime_tool_contract_issues,
+    tool_definitions_for_agent,
+    tool_definitions_for_role,
+    validate_finish_action,
+    visible_tool_names_for_agent,
+)
 
 
 def _tool_by_name(tools: list[dict[str, object]], name: str) -> dict[str, object]:
@@ -34,12 +40,25 @@ def test_tool_definitions_list_limit_uses_runtime_config() -> None:
     config.runtime.tools.list_max_limit = 81
     library = PromptLibrary(default_prompts_dir())
     tools = tool_definitions_for_role(AgentRole.WORKER, prompt_library=library, config=config)
-    for name in ("list_agent_runs", "list_tool_runs", "list_mcp_resources"):
+    for name in ("list_agent_runs", "list_tool_runs"):
         tool = _tool_by_name(tools, name)
         limit_schema = tool["function"]["parameters"]["properties"]["limit"]  # type: ignore[index]
         assert limit_schema["default"] == 37
         assert limit_schema["maximum"] == 81
         assert limit_schema["minimum"] == 1
+
+
+def test_tool_definitions_list_mcp_resources_limit_schema_stays_static() -> None:
+    config = OPMTrainConfig()
+    config.runtime.tools.list_default_limit = 37
+    config.runtime.tools.list_max_limit = 81
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.WORKER, prompt_library=library, config=config)
+    mcp_tool = _tool_by_name(tools, "list_mcp_resources")
+    limit_schema = mcp_tool["function"]["parameters"]["properties"]["limit"]  # type: ignore[index]
+    assert limit_schema["minimum"] == 1
+    assert "default" not in limit_schema
+    assert "maximum" not in limit_schema
 
 
 def test_tool_definitions_shell_schema_matches_opencompany_contract() -> None:
@@ -138,3 +157,31 @@ def test_runtime_tool_contract_issues_reports_missing_prompt_and_registry_items(
         )
     assert "root_enabled_missing_prompt_definitions:missing_one" in issues
     assert "root_enabled_missing_registry_handlers:missing_one" in issues
+
+
+def test_visible_tools_and_definitions_hide_mcp_helpers_when_mcp_disabled() -> None:
+    config = OPMTrainConfig()
+    config.extensions.mcp_enabled = False
+    library = PromptLibrary(default_prompts_dir())
+    agent = AgentNode(
+        id="agent-root",
+        session_id="session-1",
+        name="root",
+        role=AgentRole.ROOT,
+        instruction="task",
+        workspace_path=Path("."),
+    )
+    visible = visible_tool_names_for_agent(agent, config=config)
+    assert "list_mcp_servers" not in visible
+    assert "list_mcp_resources" not in visible
+    assert "read_mcp_resource" not in visible
+
+    tools = tool_definitions_for_agent(agent, prompt_library=library, config=config)
+    function_names = {
+        str(tool.get("function", {}).get("name", "")).strip()
+        for tool in tools
+        if isinstance(tool.get("function"), dict)
+    }
+    assert "list_mcp_servers" not in function_names
+    assert "list_mcp_resources" not in function_names
+    assert "read_mcp_resource" not in function_names

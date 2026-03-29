@@ -19,12 +19,15 @@ from opm_train.protocol import (
     normalize_tool_calls,
 )
 from opm_train.tools import (
+    MCP_HELPER_TOOL_NAMES,
     TERMINAL_AGENT_STATUSES,
     TERMINAL_TOOL_RUN_STATUSES,
+    mcp_enabled_for_agent,
     validate_compress_context_action,
     validate_finish_action,
     validate_wait_run_action,
     validate_wait_time_action,
+    visible_tool_names_for_agent,
 )
 from opm_train.utils import json_ready, utc_now
 
@@ -597,21 +600,23 @@ class OrchestratorAgentLifecycleMixin:
             payload={"step": context.step, "action_count": len(actions)},
         ):
             self._ensure_active_turn(agent=agent)
-            self._record_turn_actions(agent=agent, actions=actions)
+            ordered_actions = self._order_actions_for_execution(actions)
+            self._record_turn_actions(agent=agent, actions=ordered_actions)
             finish_payload: dict[str, Any] | None = None
             try:
-                for action in actions:
+                for action in ordered_actions:
                     await self.hooks.before_action(agent=agent, context=context, action=action)
                     result = await self._execute_action(agent=agent, action=action)
-                    self._record_turn_action_result(agent=agent, action=action, result=result)
+                    projected = self._project_action_result(action=action, raw_result=result)
+                    self._record_turn_action_result(agent=agent, action=action, result=projected)
                     agent.conversation.append(
                         {
                             "role": "tool",
                             "tool_call_id": str(action.get("_tool_call_id", "")),
-                            "content": json.dumps(result, ensure_ascii=False),
+                            "content": json.dumps(projected, ensure_ascii=False),
                         }
                     )
-                    await self.hooks.after_action(agent=agent, context=context, action=action, result=result)
+                    await self.hooks.after_action(agent=agent, context=context, action=action, result=projected)
                     if isinstance(result.get("finish_payload"), dict):
                         finish_payload = dict(result["finish_payload"])
                         break
@@ -631,6 +636,96 @@ class OrchestratorAgentLifecycleMixin:
                 self._persist_snapshot()
                 raise
 
+    @staticmethod
+    def _order_actions_for_execution(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Execute compress/finish at the end of each action batch."""
+        ordered: list[dict[str, Any]] = []
+        deferred_compress: list[dict[str, Any]] = []
+        deferred_finish: list[dict[str, Any]] = []
+        for action in actions:
+            action_type = str(action.get("type", "")).strip()
+            if action_type == "compress_context":
+                deferred_compress.append(action)
+                continue
+            if action_type == "finish":
+                deferred_finish.append(action)
+                continue
+            ordered.append(action)
+        return [*ordered, *deferred_compress, *deferred_finish]
+
+    def _project_action_result(self, *, action: dict[str, Any], raw_result: dict[str, Any]) -> dict[str, Any]:
+        """Project tool result into model-visible public contract."""
+        action_type = str(action.get("type", "")).strip()
+        error_text = str(raw_result.get("error", "")).strip()
+        if action_type == "finish":
+            projected: dict[str, Any] = {
+                "accepted": bool(raw_result.get("accepted", False)),
+            }
+            if error_text:
+                projected["error"] = error_text
+            return projected
+        if action_type == "wait_run":
+            projected = {
+                "wait_run_status": bool(raw_result.get("wait_run_status", False)),
+            }
+            if bool(raw_result.get("timed_out", False)):
+                projected["timed_out"] = True
+                projected["timeout_seconds"] = raw_result.get("timeout_seconds")
+            if error_text:
+                projected["error"] = error_text
+            return projected
+        if action_type == "wait_time":
+            projected = {
+                "wait_time_status": bool(raw_result.get("wait_time_status", False)),
+            }
+            if bool(raw_result.get("timed_out", False)):
+                projected["timed_out"] = True
+                projected["timeout_seconds"] = raw_result.get("timeout_seconds")
+            if error_text:
+                projected["error"] = error_text
+            return projected
+        if action_type == "spawn_agent" and "child_agent_id" in raw_result:
+            projected = {
+                "child_agent_id": str(raw_result.get("child_agent_id", "")).strip(),
+            }
+            run_id = str(raw_result.get("tool_run_id", "")).strip()
+            if run_id:
+                projected["tool_run_id"] = run_id
+            warning = str(raw_result.get("warning", "")).strip()
+            if warning:
+                projected["warning"] = warning
+            if error_text:
+                projected["error"] = error_text
+            return projected
+        if error_text:
+            return self._project_error_result(raw_result=raw_result, error_text=error_text)
+        return dict(raw_result)
+
+    @staticmethod
+    def _project_error_result(*, raw_result: dict[str, Any], error_text: str) -> dict[str, Any]:
+        """Project common error payload fields into stable public shape."""
+        projected: dict[str, Any] = {"error": error_text}
+        passthrough_fields = (
+            "error_code",
+            "next_step_hint",
+            "expected_arguments",
+            "provided_arguments",
+            "available_tools",
+            "suggested_tools",
+            "timed_out",
+            "timeout_seconds",
+            "duration_ms",
+        )
+        for field in passthrough_fields:
+            if field in raw_result:
+                projected[field] = raw_result[field]
+        warning = str(raw_result.get("warning", "")).strip()
+        if warning:
+            projected["warning"] = warning
+        if isinstance(raw_result.get("tool_run"), dict):
+            projected["tool_run"] = dict(raw_result["tool_run"])
+        return projected
+
     async def _forced_finish(self, agent: AgentNode) -> dict[str, Any] | None:
         """Provide deterministic finish payload when step budget is exhausted."""
         if agent.role == AgentRole.ROOT:
@@ -647,6 +742,8 @@ class OrchestratorAgentLifecycleMixin:
     async def _execute_action(self, *, agent: AgentNode, action: dict[str, Any]) -> dict[str, Any]:
         """Execute one validated action and persist tool-run lifecycle."""
         action_type = str(action.get("type", "")).strip()
+        visible_tools = tuple(visible_tool_names_for_agent(agent, config=self.config))
+        visible_tool_set = set(visible_tools)
         if not action_type:
             return self._reject_tool_action(
                 agent=agent,
@@ -655,7 +752,18 @@ class OrchestratorAgentLifecycleMixin:
                 error_code="missing_tool_name",
                 error_message="action type is required",
             )
-        if action_type not in set(self.config.runtime.tools.tool_names_for_role(agent.role.value)):
+        if action_type in MCP_HELPER_TOOL_NAMES and not mcp_enabled_for_agent(agent, config=self.config):
+            return self._reject_tool_action(
+                agent=agent,
+                action=action,
+                tool_name=action_type,
+                error_code="tool_unavailable",
+                error_message=(
+                    f"{action_type} is unavailable because MCP is disabled "
+                    "(extensions.mcp_enabled=false)."
+                ),
+            )
+        if action_type not in visible_tool_set:
             return self._reject_tool_action(
                 agent=agent,
                 action=action,
@@ -669,7 +777,7 @@ class OrchestratorAgentLifecycleMixin:
                 "error": validation_error,
                 "error_code": "invalid_arguments",
                 "action": json_ready(action),
-                "available_tools": list(self.config.runtime.tools.tool_names_for_role(agent.role.value)),
+                "available_tools": list(visible_tools),
             }
 
         if action_type == "finish":

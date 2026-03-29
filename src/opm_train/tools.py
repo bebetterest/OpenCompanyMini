@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from opm_train.config import OPMTrainConfig
-from opm_train.models import AgentRole, AgentStatus, ToolRunStatus
+from opm_train.models import AgentNode, AgentRole, AgentStatus, ToolRunStatus
 from opm_train.prompts import PromptLibrary
 
 
@@ -30,6 +30,14 @@ _ALLOWED_FINISH_STATUS_BY_ROLE = {
 }
 
 _RUNTIME_ROLES = ("root", "worker")
+_PAGINATED_TOOL_NAMES = frozenset({"list_agent_runs", "list_tool_runs"})
+MCP_HELPER_TOOL_NAMES = frozenset(
+    {
+        "list_mcp_servers",
+        "list_mcp_resources",
+        "read_mcp_resource",
+    }
+)
 _REQUIRED_CORE_TOOL_NAMES = frozenset(
     {
         "shell",
@@ -72,18 +80,24 @@ def tool_definitions_for_role(
             params = function.get("parameters")
             if isinstance(params, dict):
                 properties = params.get("properties")
-                if isinstance(properties, dict) and "limit" in properties:
+                if name in _PAGINATED_TOOL_NAMES and isinstance(properties, dict) and "limit" in properties:
                     limit_schema = properties.get("limit")
                     if isinstance(limit_schema, dict):
                         limit_schema["minimum"] = 1
                         limit_schema["maximum"] = int(config.runtime.tools.list_max_limit)
                         limit_schema["default"] = int(config.runtime.tools.list_default_limit)
+                        limit_schema["description"] = _list_limit_description(
+                            tool_name=name,
+                            default_limit=int(config.runtime.tools.list_default_limit),
+                            max_limit=int(config.runtime.tools.list_max_limit),
+                            hint=str(limit_schema.get("description", "")),
+                        )
                 if name == "wait_time" and isinstance(properties, dict):
                     seconds_schema = properties.get("seconds")
                     if isinstance(seconds_schema, dict):
                         wait_min, wait_max = config.runtime.tools.wait_time_bounds()
-                        seconds_schema["minimum"] = wait_min
-                        seconds_schema["maximum"] = wait_max
+                        seconds_schema["minimum"] = _json_number(wait_min)
+                        seconds_schema["maximum"] = _json_number(wait_max)
                         current_desc = str(seconds_schema.get("description", "")).strip()
                         if current_desc:
                             if any("\u4e00" <= ch <= "\u9fff" for ch in current_desc):
@@ -98,6 +112,65 @@ def tool_definitions_for_role(
                     _apply_finish_schema(params=params, role=role_name)
         resolved.append(item)
     return resolved
+
+
+def tool_definitions_for_agent(
+    agent: AgentNode,
+    *,
+    prompt_library: PromptLibrary,
+    config: OPMTrainConfig,
+) -> list[dict[str, Any]]:
+    """Resolve visible built-in and dynamic tool definitions for one agent."""
+    builtins = tool_definitions_for_role(
+        agent.role,
+        prompt_library=prompt_library,
+        config=config,
+    )
+    visible_names = set(visible_tool_names_for_agent(agent, config=config))
+    builtins = [
+        tool
+        for tool in builtins
+        if str(tool.get("function", {}).get("name", "")).strip() in visible_names
+    ]
+    return [*builtins, *agent_dynamic_tool_definitions(agent)]
+
+
+def visible_tool_names_for_agent(
+    agent: AgentNode,
+    *,
+    config: OPMTrainConfig,
+) -> tuple[str, ...]:
+    """Return visible tool names for one agent under runtime feature gates."""
+    names = list(config.runtime.tools.tool_names_for_role(agent.role.value))
+    if not mcp_enabled_for_agent(agent, config=config):
+        names = [name for name in names if name not in MCP_HELPER_TOOL_NAMES]
+    dynamic_names = [
+        str(item.get("function", {}).get("name", "")).strip()
+        for item in agent_dynamic_tool_definitions(agent)
+        if isinstance(item.get("function"), dict)
+    ]
+    return tuple(name for name in [*names, *dynamic_names] if name)
+
+
+def mcp_enabled_for_agent(agent: AgentNode, *, config: OPMTrainConfig) -> bool:
+    """Return whether MCP helper tools should be visible for this agent."""
+    if not bool(config.extensions.mcp_enabled):
+        return False
+    return bool(_agent_mcp_state(agent).get("enabled", False))
+
+
+def agent_dynamic_tool_definitions(agent: AgentNode) -> list[dict[str, Any]]:
+    """Return validated dynamic tool entries attached on agent metadata."""
+    entries = _agent_mcp_state(agent).get("dynamic_tools")
+    if not isinstance(entries, list):
+        return []
+    return [dict(item) for item in entries if isinstance(item, dict)]
+
+
+def _agent_mcp_state(agent: AgentNode) -> dict[str, Any]:
+    metadata = agent.metadata if isinstance(agent.metadata, dict) else {}
+    state = metadata.get("mcp")
+    return state if isinstance(state, dict) else {}
 
 
 def _apply_finish_schema(*, params: dict[str, Any], role: str) -> None:
@@ -235,3 +308,27 @@ def runtime_tool_contract_issues(
 def _issue(*, role: str, kind: str, tool_names: list[str]) -> str:
     """Format one machine-readable doctor issue line."""
     return f"{role}_enabled_{kind}:{','.join(tool_names)}"
+
+
+def _json_number(value: float) -> int | float:
+    """Prefer integer JSON numbers when bounds are whole values."""
+    number = float(value)
+    if number.is_integer():
+        return int(number)
+    return number
+
+
+def _list_limit_description(*, tool_name: str, default_limit: int, max_limit: int, hint: str) -> str:
+    """Build OpenCompany-style list limit description with locale awareness."""
+    has_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in hint)
+    noun_en = {
+        "list_agent_runs": "agent runs",
+        "list_tool_runs": "records",
+    }.get(tool_name, "items")
+    noun_zh = {
+        "list_agent_runs": "agent 运行",
+        "list_tool_runs": "记录",
+    }.get(tool_name, "条目")
+    if has_chinese:
+        return f"每页返回的最大{noun_zh}数。默认 {default_limit}，最大 {max_limit}。"
+    return f"Maximum number of {noun_en} to return per page. Default {default_limit}; max {max_limit}."

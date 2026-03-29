@@ -59,7 +59,7 @@ def _default_specs() -> list[ToolSpec]:
                 include_action=True,
             ),
             default_blocking=False,
-            self_completing=True,
+            self_completing=False,
         ),
         ToolSpec(
             name="steer_agent",

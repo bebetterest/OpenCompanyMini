@@ -9,7 +9,7 @@ from typing import Any
 from opm_train.config import OPMTrainConfig
 from opm_train.models import AgentNode
 from opm_train.prompts import PromptLibrary
-from opm_train.tools import tool_definitions_for_role
+from opm_train.tools import tool_definitions_for_agent
 from opm_train.utils import estimate_text_tokens
 
 
@@ -104,8 +104,8 @@ class ContextAssembler:
 
     def tools(self, agent: AgentNode) -> list[dict[str, Any]]:
         """Resolve available tool schemas for the agent role."""
-        return tool_definitions_for_role(
-            agent.role,
+        return tool_definitions_for_agent(
+            agent,
             prompt_library=self.prompt_library,
             config=self.config,
         )
