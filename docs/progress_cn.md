@@ -19,6 +19,9 @@
   - 在请求模型前先将 OpenReward 工具 schema 归一化为 OpenAI 兼容函数结构（`tools[*].function.parameters`）。
   - 当模型发出不完整提交调用（缺少必填 `answer`）时，使用 assistant 文本修复参数并继续执行。
   - 当模型仅输出文本且未触发工具调用时，若存在提交工具则自动尝试一次最终答案提交。
+- 新增可配置的工具输出回填截断：通过全局 `[runtime.context]`（`tool_output_truncate_enabled`、`tool_output_truncate_max_chars`）控制，OpenReward 会使用该配置；默认不截断，并记录 `content_chars` / `content_truncated` 追踪元信息。
+- 移除旧配置 `[runtime.openreward]` 的兼容路径；配置加载遇到该段会报错，需改为 `[runtime.context]`。
+- 新增 OpenReward 显式终止原因 `no_tool_calls`：当模型未产生工具调用且自动提交路径无法完成任务时，未完成退出会写入明确错误，而不再是静默 `error: null`。
 - 新增 `.opm_train/batches/<batch_id>/openreward_trace.jsonl`，落盘逐轮 OpenReward 请求/返回/工具事件，便于调试与审计。
 - 扩展 OpenReward 回归测试，覆盖工具 schema 归一化、缺失 `answer` 修复、纯文本自动提交流程。
 

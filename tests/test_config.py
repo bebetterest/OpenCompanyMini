@@ -71,6 +71,60 @@ def test_load_runtime_limits_protocol_retry_fields() -> None:
         assert config.runtime.limits.protocol_retry_backoff_seconds == 0.6
 
 
+def test_runtime_context_defaults_tool_output_truncation_disabled() -> None:
+    config = OPMTrainConfig()
+    assert config.runtime.context.tool_output_truncate_enabled is False
+    assert config.runtime.context.tool_output_truncate_max_chars == 8000
+
+
+def test_load_runtime_context_tool_output_truncation_config() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        (app_dir / "opm_train.toml").write_text(
+            "\n".join(
+                [
+                    "[runtime.context]",
+                    "tool_output_truncate_enabled = true",
+                    "tool_output_truncate_max_chars = 1024",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        config = OPMTrainConfig.load(app_dir)
+        assert config.runtime.context.tool_output_truncate_enabled is True
+        assert config.runtime.context.tool_output_truncate_max_chars == 1024
+
+
+def test_snapshot_includes_runtime_context_tool_output_truncation_fields() -> None:
+    config = OPMTrainConfig()
+    config.runtime.context.tool_output_truncate_enabled = True
+    config.runtime.context.tool_output_truncate_max_chars = 2048
+    context_snapshot = config.as_snapshot()["runtime"]["context"]
+    assert context_snapshot["tool_output_truncate_enabled"] is True
+    assert context_snapshot["tool_output_truncate_max_chars"] == 2048
+
+
+def test_legacy_runtime_openreward_section_is_rejected() -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        (app_dir / "opm_train.toml").write_text(
+            "\n".join(
+                [
+                    "[runtime.openreward]",
+                    "tool_output_truncate_enabled = true",
+                    "tool_output_truncate_max_chars = 1536",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        try:
+            OPMTrainConfig.load(app_dir)
+        except ValueError as exc:
+            assert "[runtime.openreward]" in str(exc)
+        else:
+            raise AssertionError("expected ValueError for legacy [runtime.openreward] section")
+
+
 def test_default_tinker_profile_matches_openai_compatible_inference_endpoint() -> None:
     config = OPMTrainConfig()
     profile = config.provider.tinker

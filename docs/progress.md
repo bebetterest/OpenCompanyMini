@@ -19,6 +19,9 @@
   - Normalize OpenReward tool schemas into OpenAI-compatible function shape (`tools[*].function.parameters`) before model requests.
   - Repair missing required `answer` arguments from assistant free text when model emits incomplete submit calls.
   - Auto-submit one final answer attempt when model returns text-only output without tool calls and a submission tool is available.
+- Added configurable tool-output bounding before replay into model context via global `[runtime.context]` (`tool_output_truncate_enabled`, `tool_output_truncate_max_chars`), used by OpenReward with defaults set to no truncation and trace metadata (`content_chars`/`content_truncated`) for observability.
+- Removed legacy `[runtime.openreward]` compatibility; config load now rejects that section and requires `[runtime.context]` for truncation controls.
+- Added explicit OpenReward loop stop reason `no_tool_calls` when the model returns no tool call and no auto-submit path finishes the task, so unfinished exits are diagnosable instead of silent `error: null`.
 - Added `.opm_train/batches/<batch_id>/openreward_trace.jsonl` to persist per-turn OpenReward request/response/tool events for debugging and audits.
 - Expanded OpenReward regression coverage for tool-schema normalization, missing-answer repair, and text-only auto-submit paths.
 

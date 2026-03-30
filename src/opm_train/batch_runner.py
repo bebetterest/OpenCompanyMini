@@ -27,6 +27,7 @@ _OPENREWARD_DATASET_NAME = "openreward"
 _OPENREWARD_RESULTS_FILENAME = "openreward_results.jsonl"
 _OPENREWARD_SUMMARY_FILENAME = "openreward_summary.json"
 _OPENREWARD_TRACE_FILENAME = "openreward_trace.jsonl"
+_OPENREWARD_TOOL_CONTENT_DEFAULT_MAX_CHARS = 8000
 _RowT = TypeVar("_RowT")
 
 
@@ -314,6 +315,14 @@ async def _run_openreward_batch(
         trace_lock=trace_lock,
         environment_name=str(config.environment or ""),
         variant_name=_optional_str(config.variant),
+        tool_output_truncate_enabled=bool(runtime_config.runtime.context.tool_output_truncate_enabled),
+        tool_output_truncate_max_chars=max(
+            1,
+            int(
+                runtime_config.runtime.context.tool_output_truncate_max_chars
+                or _OPENREWARD_TOOL_CONTENT_DEFAULT_MAX_CHARS
+            ),
+        ),
     )
 
     all_rows = [*existing_rows, *new_rows]
@@ -378,6 +387,8 @@ async def _run_pending_openreward_tasks(
     trace_lock: asyncio.Lock,
     environment_name: str,
     variant_name: str | None,
+    tool_output_truncate_enabled: bool,
+    tool_output_truncate_max_chars: int,
 ) -> list[OpenRewardBatchItemResult]:
     """Run pending OpenReward tasks and append each row immediately."""
     semaphore = asyncio.Semaphore(concurrency)
@@ -397,6 +408,8 @@ async def _run_pending_openreward_tasks(
                 variant_name=variant_name,
                 trace_path=trace_path,
                 trace_lock=trace_lock,
+                tool_output_truncate_enabled=tool_output_truncate_enabled,
+                tool_output_truncate_max_chars=tool_output_truncate_max_chars,
             )
         )
         for item in task_refs
@@ -527,6 +540,8 @@ async def _run_one_openreward_task(
     variant_name: str | None,
     trace_path: Path,
     trace_lock: asyncio.Lock,
+    tool_output_truncate_enabled: bool,
+    tool_output_truncate_max_chars: int,
 ) -> OpenRewardBatchItemResult:
     """Run one OpenReward task by looping model/tool calls until termination."""
     async with semaphore:
@@ -550,6 +565,8 @@ async def _run_one_openreward_task(
                 trace_path=trace_path,
                 trace_lock=trace_lock,
                 trace_context=trace_context,
+                tool_output_truncate_enabled=tool_output_truncate_enabled,
+                tool_output_truncate_max_chars=tool_output_truncate_max_chars,
             )
         except OpenRewardLoopError as exc:
             return OpenRewardBatchItemResult(
@@ -608,12 +625,15 @@ async def _run_openreward_session_loop(
     trace_path: Path,
     trace_lock: asyncio.Lock,
     trace_context: dict[str, Any],
+    tool_output_truncate_enabled: bool,
+    tool_output_truncate_max_chars: int,
 ) -> OpenRewardLoopOutcome:
     """Execute one OpenReward task loop and return loop-level telemetry."""
     reward_total = 0.0
     finished = False
     tool_calls = 0
     turns = 0
+    stop_reason: str | None = None
     auto_submit_attempted = False
     required_fields_by_tool = _required_tool_fields_by_name(tools)
     submission_tool_name = _infer_submission_tool_name(tools)
@@ -662,7 +682,17 @@ async def _run_openreward_session_loop(
                     },
                 )
                 tool_output = await _maybe_await(session.call_tool(tool_name, tool_arguments))
-                reward, call_finished, tool_content = _observe_openreward_tool_output(tool_output)
+                (
+                    reward,
+                    call_finished,
+                    tool_content,
+                    tool_content_chars,
+                    tool_content_truncated,
+                ) = _observe_openreward_tool_output(
+                    tool_output,
+                    truncate_enabled=tool_output_truncate_enabled,
+                    truncate_max_chars=tool_output_truncate_max_chars,
+                )
                 await trace(
                     "tool_result",
                     {
@@ -671,6 +701,8 @@ async def _run_openreward_session_loop(
                         "reward": reward,
                         "finished": call_finished,
                         "content": tool_content,
+                        "content_chars": tool_content_chars,
+                        "content_truncated": tool_content_truncated,
                     },
                 )
                 messages.append(
@@ -745,6 +777,7 @@ async def _run_openreward_session_loop(
                         reward_total += reward_delta
                         finished = call_finished
                         continue
+                    stop_reason = "no_tool_calls"
                     break
 
                 for call in normalized_tool_calls:
@@ -838,7 +871,12 @@ async def _run_openreward_session_loop(
             ),
         ) from exc
 
-    loop_error = "max_steps_reached" if turns >= max_steps and not finished else None
+    loop_error: str | None = None
+    if not finished:
+        if turns >= max_steps:
+            loop_error = "max_steps_reached"
+        elif stop_reason is not None:
+            loop_error = stop_reason
     await trace(
         "task_completed",
         {
@@ -1815,12 +1853,26 @@ def _resolve_openreward_tool_arguments(
     return repaired_arguments, repaired_missing_required, repair_reason
 
 
-def _observe_openreward_tool_output(tool_output: Any) -> tuple[float, bool, str]:
-    """Normalize tool output into `(reward, finished, rendered_content)` tuple."""
+def _observe_openreward_tool_output(
+    tool_output: Any,
+    *,
+    truncate_enabled: bool,
+    truncate_max_chars: int,
+) -> tuple[float, bool, str, int, bool]:
+    """Normalize tool output into reward/finish plus bounded tool content."""
     reward = _coerce_reward(_object_get(tool_output, "reward"))
     finished = bool(_object_get(tool_output, "finished", False))
-    rendered_content = _render_tool_output(tool_output)
-    return reward, finished, rendered_content
+    rendered_content = str(_render_tool_output(tool_output) or "")
+    content_chars = len(rendered_content)
+    if truncate_enabled:
+        bounded_content, was_truncated = _truncate_openreward_tool_content(
+            rendered_content,
+            max_chars=max(1, int(truncate_max_chars)),
+        )
+    else:
+        bounded_content = rendered_content
+        was_truncated = False
+    return reward, finished, bounded_content, content_chars, was_truncated
 
 
 def _build_openreward_task_key(
@@ -1938,6 +1990,24 @@ def _render_tool_output(tool_output: Any) -> str:
     if data is not None:
         return str(data)
     return str(tool_output)
+
+
+def _truncate_openreward_tool_content(content: str, *, max_chars: int) -> tuple[str, bool]:
+    """Truncate oversized tool output before feeding it back into model context."""
+    text = str(content or "")
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
+        return text, False
+
+    marker = f"\n...[output truncated to {limit} chars from {len(text)} chars]...\n"
+    if len(marker) >= limit:
+        return text[:limit], True
+
+    available = limit - len(marker)
+    head_keep = max(1, int(available * 0.7))
+    tail_keep = max(1, available - head_keep)
+    bounded = f"{text[:head_keep]}{marker}{text[-tail_keep:]}"
+    return bounded, True
 
 
 def _coerce_reward(value: Any) -> float:

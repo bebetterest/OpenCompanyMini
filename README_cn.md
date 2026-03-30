@@ -265,6 +265,10 @@ PY
 - 对工具参数脆弱场景提供兜底：
   - 若模型发出缺少必填 `answer` 的工具调用，会从 assistant 文本提取候选答案并修复参数后重试。
   - 若模型只输出文本（无工具调用）且存在提交工具，会自动尝试一次提交。
+- 工具输出截断是全局配置，位于 `[runtime.context]`（OpenReward 工具回填会使用该配置）：
+  - 默认关闭（`tool_output_truncate_enabled = false`）
+  - 可设置长度上限 `tool_output_truncate_max_chars`（仅在开启截断时生效）
+  - `openreward_trace.jsonl` 会记录 `content_chars` 与 `content_truncated`
 - 结果输出采用 OpenReward 专用奖励语义，产物文件：
   - `openreward_results.jsonl`
   - `openreward_summary.json`
@@ -361,6 +365,10 @@ class MyDatasetAdapter(DatasetAdapter):
 - 运行限制（子代理数量、并发代理数、步数预算）。
 - 模型协议解析失败重试控制（`max_protocol_retries`、`protocol_retry_backoff_seconds`）。
 - 工具集合与上下文压缩阈值。
+- `[runtime.context]` 提供全局工具回填截断控制：
+  - `tool_output_truncate_enabled`（默认 `false`）
+  - `tool_output_truncate_max_chars`（默认 `8000`，开启截断时生效）
+- 旧配置段 `[runtime.openreward]` 已不再支持。
 - `sandbox`、`mcp`、`skills` 为 v0 预留开关，暂不实现。
 
 ## 工具扩展流程

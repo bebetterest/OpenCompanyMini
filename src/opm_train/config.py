@@ -158,6 +158,8 @@ class RuntimeContextConfig:
     keep_pinned_messages: int = 1
     max_context_tokens: int = 96_000
     compression_model: str = ""
+    tool_output_truncate_enabled: bool = False
+    tool_output_truncate_max_chars: int = 8000
 
 
 @dataclass(slots=True)
@@ -268,8 +270,14 @@ class OPMTrainConfig:
         """Merge ``[runtime]`` section."""
         if not payload:
             return
+        context_payload = _as_dict(payload.get("context"))
+        if isinstance(payload.get("openreward"), dict):
+            raise ValueError(
+                "Unsupported config section [runtime.openreward]. "
+                "Use [runtime.context] with tool_output_truncate_enabled/tool_output_truncate_max_chars."
+            )
         self._merge_runtime_limits(_as_dict(payload.get("limits")))
-        self._merge_runtime_context(_as_dict(payload.get("context")))
+        self._merge_runtime_context(context_payload)
         self._merge_runtime_tools(_as_dict(payload.get("tools")))
 
     def _merge_runtime_limits(self, payload: dict[str, Any]) -> None:
@@ -301,6 +309,15 @@ class OPMTrainConfig:
             keep_pinned_messages=_as_int(payload.get("keep_pinned_messages"), current.keep_pinned_messages, minimum=0),
             max_context_tokens=_as_int(payload.get("max_context_tokens"), current.max_context_tokens, minimum=1),
             compression_model=str(payload.get("compression_model", current.compression_model)).strip(),
+            tool_output_truncate_enabled=_as_bool(
+                payload.get("tool_output_truncate_enabled"),
+                current.tool_output_truncate_enabled,
+            ),
+            tool_output_truncate_max_chars=_as_int(
+                payload.get("tool_output_truncate_max_chars"),
+                current.tool_output_truncate_max_chars,
+                minimum=1,
+            ),
         )
 
     def _merge_runtime_tools(self, payload: dict[str, Any]) -> None:
@@ -426,3 +443,18 @@ def _as_str_dict(value: Any, fallback: dict[str, str]) -> dict[str, str]:
         for key, entry in value.items()
         if str(key).strip()
     }
+
+
+def _as_bool(value: Any, fallback: bool) -> bool:
+    """Parse boolean-ish values with fallback."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(fallback)

@@ -265,6 +265,10 @@ Note: the JSONL loader streams physical lines (instead of using `splitlines()`),
 - Defensive fallback behavior for fragile tool-argument generations:
   - If model emits a tool call missing required `answer`, runtime extracts a candidate from assistant text and retries with repaired arguments.
   - If model emits text only (no tool call) while a submission tool is available, runtime performs one auto-submit attempt.
+- Tool-output truncation is configured globally via `[runtime.context]` (used by OpenReward tool replay):
+  - Default: disabled (`tool_output_truncate_enabled = false`)
+  - Optional cap: `tool_output_truncate_max_chars` (effective only when truncation is enabled)
+  - Trace metadata: `openreward_trace.jsonl` records `content_chars` and `content_truncated`
 - Results/summary use OpenReward-specific fields (reward-based), persisted to:
   - `openreward_results.jsonl`
   - `openreward_summary.json`
@@ -361,6 +365,10 @@ Edit `opm_train.toml`:
 - Runtime limits (`max_children_per_agent`, `max_active_agents`, step budgets).
 - Protocol retry controls for invalid model payloads (`max_protocol_retries`, `protocol_retry_backoff_seconds`).
 - Runtime tools and context compression thresholds.
+- Global tool-output replay controls under `[runtime.context]`:
+  - `tool_output_truncate_enabled` (default `false`)
+  - `tool_output_truncate_max_chars` (default `8000`; used when truncation is enabled)
+- Legacy `[runtime.openreward]` is no longer supported.
 - Deferred extension flags (`sandbox`, `mcp`, `skills`) reserved for later versions.
 
 ## Tool Extension Workflow

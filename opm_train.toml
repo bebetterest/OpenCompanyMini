@@ -49,6 +49,8 @@ enabled = true
 auto_compress_ratio = 0.8
 keep_pinned_messages = 1
 max_context_tokens = 96000
+tool_output_truncate_enabled = false
+tool_output_truncate_max_chars = 8000
 
 [runtime.tools]
 root_tools = [

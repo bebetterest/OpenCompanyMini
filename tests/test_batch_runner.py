@@ -145,6 +145,21 @@ class _RequiredAnswerOpenRewardEnvironment(_FakeOpenRewardEnvironment):
         ]
 
 
+class _LargeOutputOpenRewardSession(_FakeOpenRewardSession):
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> _FakeToolOutput:
+        self.call_count += 1
+        _ = arguments
+        if name != "answer":
+            return _FakeToolOutput(text="unknown", reward=0.0, finished=False)
+        return _FakeToolOutput(text="X" * 1200, reward=1.0, finished=True)
+
+
+class _LargeOutputOpenRewardEnvironment(_RequiredAnswerOpenRewardEnvironment):
+    def session(self, *, task: dict[str, object]) -> _LargeOutputOpenRewardSession:
+        self.session_count += 1
+        return _LargeOutputOpenRewardSession(task=task, never_finish=False)
+
+
 def _patch_openreward_client(monkeypatch: pytest.MonkeyPatch, environment: object) -> None:
     class _ClientFactory:
         def __init__(self) -> None:
@@ -906,6 +921,44 @@ def test_normalize_openreward_tool_definition_normalizes_openrouter_shape() -> N
     }
 
 
+def test_truncate_openreward_tool_content_keeps_small_payload() -> None:
+    text = "short content"
+    bounded, truncated = batch_runner_module._truncate_openreward_tool_content(text, max_chars=128)
+    assert bounded == text
+    assert truncated is False
+
+
+def test_observe_openreward_tool_output_truncates_large_payload() -> None:
+    raw_text = "A" * 9000
+    tool_output = _FakeToolOutput(text=raw_text, reward=0.25, finished=False)
+    reward, finished, bounded, content_chars, truncated = batch_runner_module._observe_openreward_tool_output(
+        tool_output,
+        truncate_enabled=True,
+        truncate_max_chars=batch_runner_module._OPENREWARD_TOOL_CONTENT_DEFAULT_MAX_CHARS,
+    )
+    assert reward == 0.25
+    assert finished is False
+    assert content_chars == len(raw_text)
+    assert truncated is True
+    assert len(bounded) <= batch_runner_module._OPENREWARD_TOOL_CONTENT_DEFAULT_MAX_CHARS
+    assert "output truncated" in bounded
+
+
+def test_observe_openreward_tool_output_keeps_large_payload_when_truncation_disabled() -> None:
+    raw_text = "A" * 9000
+    tool_output = _FakeToolOutput(text=raw_text, reward=0.25, finished=False)
+    reward, finished, bounded, content_chars, truncated = batch_runner_module._observe_openreward_tool_output(
+        tool_output,
+        truncate_enabled=False,
+        truncate_max_chars=32,
+    )
+    assert reward == 0.25
+    assert finished is False
+    assert content_chars == len(raw_text)
+    assert truncated is False
+    assert bounded == raw_text
+
+
 @pytest.mark.asyncio
 async def test_run_batch_openreward_repairs_missing_answer_argument(monkeypatch: pytest.MonkeyPatch) -> None:
     with TemporaryDirectory() as temp_dir:
@@ -986,3 +1039,116 @@ async def test_run_batch_openreward_auto_submits_when_model_returns_text_only(mo
         assert rows[0]["session_status"] == "completed"
         assert rows[0]["finished"] is True
         assert rows[0]["reward_total"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_marks_no_tool_calls_when_model_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        environment = _RequiredAnswerOpenRewardEnvironment([{"task_id": "t1", "answer": "42"}])
+        _patch_openreward_client(monkeypatch, environment)
+
+        class _EmptyNoToolCallLLM:
+            async def stream_chat(self, **kwargs: object) -> ChatResult:
+                _ = kwargs
+                return ChatResult(content="", raw_events=[], tool_calls=[])
+
+        monkeypatch.setattr(
+            batch_runner_module,
+            "_build_openreward_llm_client",
+            lambda profile: _EmptyNoToolCallLLM(),
+        )
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+            )
+        )
+
+        assert isinstance(output.summary, batch_runner_module.OpenRewardBatchSummary)
+        rows = [json.loads(line) for line in output.results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert rows[0]["session_status"] == "completed"
+        assert rows[0]["finished"] is False
+        assert rows[0]["error"] == "no_tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_tool_output_not_truncated_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        environment = _LargeOutputOpenRewardEnvironment([{"task_id": "t1", "answer": "42"}])
+        _patch_openreward_client(monkeypatch, environment)
+        monkeypatch.setattr(batch_runner_module, "_build_openreward_llm_client", lambda profile: _FakeOpenRewardLLM())
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+            )
+        )
+
+        trace_events = [
+            json.loads(line)
+            for line in (output.batch_dir / "openreward_trace.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        tool_result = next(item for item in trace_events if item.get("event") == "tool_result")
+        assert tool_result["content_chars"] == 1200
+        assert tool_result["content_truncated"] is False
+        assert len(str(tool_result["content"])) == 1200
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_tool_output_truncation_from_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        (app_dir / "opm_train.toml").write_text(
+            "\n".join(
+                [
+                    "[runtime.context]",
+                    "tool_output_truncate_enabled = true",
+                    "tool_output_truncate_max_chars = 128",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        environment = _LargeOutputOpenRewardEnvironment([{"task_id": "t1", "answer": "42"}])
+        _patch_openreward_client(monkeypatch, environment)
+        monkeypatch.setattr(batch_runner_module, "_build_openreward_llm_client", lambda profile: _FakeOpenRewardLLM())
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+            )
+        )
+
+        trace_events = [
+            json.loads(line)
+            for line in (output.batch_dir / "openreward_trace.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        tool_result = next(item for item in trace_events if item.get("event") == "tool_result")
+        assert tool_result["content_chars"] == 1200
+        assert tool_result["content_truncated"] is True
+        assert len(str(tool_result["content"])) <= 128
+        assert "output truncated" in str(tool_result["content"])
