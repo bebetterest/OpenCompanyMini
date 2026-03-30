@@ -125,7 +125,8 @@ class OpenAICompatibleClient:
                         headers=self.headers,
                         json=payload,
                     ) as response:
-                        response.raise_for_status()
+                        if response.status_code >= 400:
+                            raise await _http_status_error(response)
                         async for chunk in response.aiter_text():
                             for event_data in parser.feed(chunk):
                                 if event_data == "[DONE]":
@@ -265,6 +266,29 @@ def _tool_calls_payload(parts: dict[int, dict[str, str]]) -> list[dict[str, Any]
             }
         )
     return payloads
+
+
+async def _http_status_error(response: httpx.Response) -> httpx.HTTPStatusError:
+    """Build HTTPStatusError with response body preview for easier debugging."""
+    code = int(response.status_code)
+    if 400 <= code < 500:
+        family = "Client error"
+    elif 500 <= code < 600:
+        family = "Server error"
+    else:
+        family = "HTTP error"
+    reason = str(response.reason_phrase or "").strip() or "Unknown"
+    message = f"{family} '{code} {reason}' for url '{response.request.url}'"
+    body_preview = ""
+    try:
+        body = await response.aread()
+    except Exception:
+        body_preview = ""
+    else:
+        body_preview = body.decode("utf-8", errors="replace").strip()
+    if body_preview:
+        message = f"{message}; response_body={body_preview[:4000]}"
+    return httpx.HTTPStatusError(message, request=response.request, response=response)
 
 
 async def _maybe_await(value: Any) -> None:

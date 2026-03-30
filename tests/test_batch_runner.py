@@ -127,6 +127,24 @@ class _SplitOpenRewardEnvironment:
         return _FakeOpenRewardSession(task=task, never_finish=False)
 
 
+class _RequiredAnswerOpenRewardEnvironment(_FakeOpenRewardEnvironment):
+    async def list_tools(self, *, format: str) -> list[dict[str, object]]:
+        self.last_tool_format = format
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "answer",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                },
+            }
+        ]
+
+
 def _patch_openreward_client(monkeypatch: pytest.MonkeyPatch, environment: object) -> None:
     class _ClientFactory:
         def __init__(self) -> None:
@@ -865,3 +883,106 @@ async def test_run_batch_openreward_client_init_fallback_keeps_api_key(monkeypat
         assert isinstance(output.summary, batch_runner_module.OpenRewardBatchSummary)
         assert output.summary.total == 1
         assert state["api_key"] == "dummy-openreward-key"
+
+
+def test_normalize_openreward_tool_definition_normalizes_openrouter_shape() -> None:
+    payload = {
+        "type": "function",
+        "function": {"name": "submit", "description": "Submit final answer"},
+        "parameters": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
+    }
+    normalized = batch_runner_module._normalize_openreward_tool_definition(payload)
+    assert normalized == {
+        "type": "function",
+        "function": {
+            "name": "submit",
+            "description": "Submit final answer",
+            "parameters": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_repairs_missing_answer_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        environment = _RequiredAnswerOpenRewardEnvironment([{"task_id": "t1", "answer": "42"}])
+        _patch_openreward_client(monkeypatch, environment)
+
+        class _MissingAnswerLLM:
+            async def stream_chat(self, **kwargs: object) -> ChatResult:
+                messages = kwargs["messages"]
+                assert isinstance(messages, list)
+                has_tool = any(isinstance(item, dict) and item.get("role") == "tool" for item in messages)
+                if has_tool:
+                    return ChatResult(content="done", raw_events=[], tool_calls=[])
+                return ChatResult(
+                    content="42",
+                    raw_events=[],
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "answer", "arguments": "{}"},
+                        }
+                    ],
+                )
+
+        monkeypatch.setattr(batch_runner_module, "_build_openreward_llm_client", lambda profile: _MissingAnswerLLM())
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+            )
+        )
+
+        assert isinstance(output.summary, batch_runner_module.OpenRewardBatchSummary)
+        assert output.summary.failed == 0
+        rows = [json.loads(line) for line in output.results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert rows[0]["session_status"] == "completed"
+        assert rows[0]["finished"] is True
+        assert rows[0]["reward_total"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_auto_submits_when_model_returns_text_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        environment = _RequiredAnswerOpenRewardEnvironment([{"task_id": "t1", "answer": "42"}])
+        _patch_openreward_client(monkeypatch, environment)
+
+        class _NoToolCallLLM:
+            async def stream_chat(self, **kwargs: object) -> ChatResult:
+                _ = kwargs
+                return ChatResult(content="42", raw_events=[], tool_calls=[])
+
+        monkeypatch.setattr(batch_runner_module, "_build_openreward_llm_client", lambda profile: _NoToolCallLLM())
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+            )
+        )
+
+        assert isinstance(output.summary, batch_runner_module.OpenRewardBatchSummary)
+        assert output.summary.failed == 0
+        rows = [json.loads(line) for line in output.results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert rows[0]["session_status"] == "completed"
+        assert rows[0]["finished"] is True
+        assert rows[0]["reward_total"] == 1.0

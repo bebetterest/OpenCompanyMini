@@ -2,6 +2,7 @@
 
 ## 2026-03-29
 
+- 提升 OpenRouter profile 的重试预算（`provider.openrouter.max_retries`），用于真实批跑时更好吸收 provider 侧瞬时限流（尤其是免费模型）。
 - 为 `opm-train batch-run` 扩展 `--dataset openreward` 模式，新增 OpenReward 参数：`--environment`、`--split`、`--task-index`、`--start`、`--stop`、`--variant`、`--base-url`、`--openreward-tool-format`、`--max-steps`。
 - 增加 OpenReward 模式参数校验：`--environment` 必填、`--task-index` 与 `--start/--stop` 互斥、非 OpenReward 数据集仍要求 `--input`、`--max-steps` 必须为正数。
 - 在 `batch_runner` 新增 OpenReward 执行后端：通过 `list_tasks/get_task/get_task_range` 选题，使用 `session/call_tool` 执行工具回合，并接入 OpenAI 兼容模型循环与确定性终止条件（`finished`、无工具调用、步数上限）。
@@ -14,6 +15,12 @@
 - 新增 OpenReward 混合选择能力：通过可重复 `--task-spec`（`<split>` 或 `<split>:<start>:<stop>`）在一次批跑中组合多个 split 与区间任务。
 - 增加混合选择参数校验（`--task-spec` 与旧选择器 `--task-index` / `--start` / `--stop` 互斥）及多 split/区间展开测试。
 - 增强 OpenReward SDK 兼容性：环境解析优先使用显式 `variant` 选择，并在 client 初始化时对 `api_key/base_url` 组合做逐级回退重试。
+- 增强 OpenReward 工具调用稳定性，新增三层运行时保护：
+  - 在请求模型前先将 OpenReward 工具 schema 归一化为 OpenAI 兼容函数结构（`tools[*].function.parameters`）。
+  - 当模型发出不完整提交调用（缺少必填 `answer`）时，使用 assistant 文本修复参数并继续执行。
+  - 当模型仅输出文本且未触发工具调用时，若存在提交工具则自动尝试一次最终答案提交。
+- 新增 `.opm_train/batches/<batch_id>/openreward_trace.jsonl`，落盘逐轮 OpenReward 请求/返回/工具事件，便于调试与审计。
+- 扩展 OpenReward 回归测试，覆盖工具 schema 归一化、缺失 `answer` 修复、纯文本自动提交流程。
 
 ## 2026-03-25
 

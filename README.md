@@ -113,6 +113,7 @@ By default, runtime data is written under:
 - `.opm_train/batches/<batch_id>/summary.json` (aggregate metrics)
 - `.opm_train/batches/<batch_id>/openreward_results.jsonl` (per-task OpenReward records)
 - `.opm_train/batches/<batch_id>/openreward_summary.json` (OpenReward aggregate metrics)
+- `.opm_train/batches/<batch_id>/openreward_trace.jsonl` (per-turn OpenReward request/response/tool trace)
 - `.opm_train/sft_runs/<run_id>/config.json` (resolved run config + dataset mapping)
 - `.opm_train/sft_runs/<run_id>/metrics.jsonl` (per-step training metrics)
 - `.opm_train/sft_runs/<run_id>/result.json` (terminal backend summary)
@@ -260,9 +261,14 @@ Note: the JSONL loader streams physical lines (instead of using `splitlines()`),
   - `openrouter` profile -> `openrouter`
   - `tinker` / `custom` profile -> `openai`
   - Override with `--openreward-tool-format`.
+- Runtime normalizes OpenReward tool definitions into OpenAI-compatible `tools[*].function.parameters` payloads before model calls.
+- Defensive fallback behavior for fragile tool-argument generations:
+  - If model emits a tool call missing required `answer`, runtime extracts a candidate from assistant text and retries with repaired arguments.
+  - If model emits text only (no tool call) while a submission tool is available, runtime performs one auto-submit attempt.
 - Results/summary use OpenReward-specific fields (reward-based), persisted to:
   - `openreward_results.jsonl`
   - `openreward_summary.json`
+  - `openreward_trace.jsonl`
 
 OfficeQA example (single task):
 
@@ -335,7 +341,7 @@ class MyDatasetAdapter(DatasetAdapter):
 - Realtime JSONL append (`results.jsonl` is written as each sample finishes).
 - Resume support (`--batch-id <id> --resume`) skips already completed `(adapter_name, sample_id)` and continues the rest.
 - Smoke mode (`--smoke`) runs batch without external LLM API keys.
-- `openreward` mode writes dedicated reward-based artifacts (`openreward_results.jsonl`, `openreward_summary.json`) and reports `completed`/`finished`/`avg_reward` metrics.
+- `openreward` mode writes dedicated reward-based artifacts (`openreward_results.jsonl`, `openreward_summary.json`, `openreward_trace.jsonl`) and reports `completed`/`finished`/`avg_reward` metrics.
 
 `results.jsonl` rows include:
 

@@ -337,6 +337,7 @@
       "description": "阻塞等待指定 tool run 或 agent run 进入要求的终态。",
       "parameters": {
         "type": "object",
+        "description": "必须且只能提供 tool_run_id 或 agent_id 其中之一，运行时会校验该约束。",
         "properties": {
           "tool_run_id": {
             "type": "string",
@@ -347,28 +348,6 @@
             "description": "目标 agent 的稳定 ID（前缀：agent-）。"
           }
         },
-        "oneOf": [
-          {
-            "required": [
-              "tool_run_id"
-            ],
-            "not": {
-              "required": [
-                "agent_id"
-              ]
-            }
-          },
-          {
-            "required": [
-              "agent_id"
-            ],
-            "not": {
-              "required": [
-                "tool_run_id"
-              ]
-            }
-          }
-        ],
         "additionalProperties": false
       }
     }

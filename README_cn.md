@@ -113,6 +113,7 @@ opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] 
 - `.opm_train/batches/<batch_id>/summary.json`（汇总指标）
 - `.opm_train/batches/<batch_id>/openreward_results.jsonl`（OpenReward 逐任务记录）
 - `.opm_train/batches/<batch_id>/openreward_summary.json`（OpenReward 汇总指标）
+- `.opm_train/batches/<batch_id>/openreward_trace.jsonl`（OpenReward 逐轮请求/返回/工具调用追踪）
 - `.opm_train/sft_runs/<run_id>/config.json`（解析后的运行配置与数据映射）
 - `.opm_train/sft_runs/<run_id>/metrics.jsonl`（逐 step 训练指标）
 - `.opm_train/sft_runs/<run_id>/result.json`（后端终态摘要）
@@ -260,9 +261,14 @@ PY
   - `openrouter` -> `openrouter`
   - `tinker` / `custom` -> `openai`
   - 可用 `--openreward-tool-format` 覆盖。
+- 运行时会先把 OpenReward 工具定义归一化为 OpenAI 兼容的 `tools[*].function.parameters` 结构，再发给模型。
+- 对工具参数脆弱场景提供兜底：
+  - 若模型发出缺少必填 `answer` 的工具调用，会从 assistant 文本提取候选答案并修复参数后重试。
+  - 若模型只输出文本（无工具调用）且存在提交工具，会自动尝试一次提交。
 - 结果输出采用 OpenReward 专用奖励语义，产物文件：
   - `openreward_results.jsonl`
   - `openreward_summary.json`
+  - `openreward_trace.jsonl`
 
 OfficeQA 单任务示例：
 
@@ -335,7 +341,7 @@ class MyDatasetAdapter(DatasetAdapter):
 - 实时写入 JSONL（每个样本完成即追加到 `results.jsonl`）。
 - 支持断点续跑（`--batch-id <id> --resume`），按 `(adapter_name, sample_id)` 跳过已完成样本并继续未完成部分。
 - 支持 `--smoke` 模式，无需外部 LLM API Key 即可跑通批量链路。
-- `openreward` 模式会写入奖励语义专用产物（`openreward_results.jsonl`、`openreward_summary.json`），并输出 `completed`/`finished`/`avg_reward` 等指标。
+- `openreward` 模式会写入奖励语义专用产物（`openreward_results.jsonl`、`openreward_summary.json`、`openreward_trace.jsonl`），并输出 `completed`/`finished`/`avg_reward` 等指标。
 
 `results.jsonl` 单行字段包括：
 

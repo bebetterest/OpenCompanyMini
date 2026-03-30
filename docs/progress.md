@@ -2,6 +2,7 @@
 
 ## 2026-03-29
 
+- Increased OpenRouter profile retry budget for real batch runs (`provider.openrouter.max_retries`) to better absorb transient provider-side rate limits (especially free-tier models).
 - Extended `opm-train batch-run` with `--dataset openreward` mode, including OpenReward selectors/options: `--environment`, `--split`, `--task-index`, `--start`, `--stop`, `--variant`, `--base-url`, `--openreward-tool-format`, and `--max-steps`.
 - Added CLI validation rules for OpenReward mode (`--environment` required, `--task-index` mutually exclusive with `--start/--stop`, `--input` still required for non-OpenReward datasets, `--max-steps` must be positive).
 - Added OpenReward execution backend in `batch_runner`: task selection via `list_tasks/get_task/get_task_range`, session tool loop via `session/call_tool`, OpenAI-compatible model turns, and deterministic stop conditions (`finished`, no tool calls, step budget).
@@ -14,6 +15,12 @@
 - Extended OpenReward selection with mixed selectors via repeatable `--task-spec` (`<split>` or `<split>:<start>:<stop>`), allowing one batch to combine multiple splits and ranges.
 - Added mixed-selector validation (`--task-spec` mutually exclusive with legacy `--task-index` / `--start` / `--stop`) and tests for multi-split/range expansion.
 - Hardened OpenReward SDK compatibility: environment resolution now prioritizes explicit `variant` selectors, and client construction retries `api_key/base_url` argument combinations before fallback.
+- Hardened OpenReward tool-call reliability with three runtime safeguards:
+  - Normalize OpenReward tool schemas into OpenAI-compatible function shape (`tools[*].function.parameters`) before model requests.
+  - Repair missing required `answer` arguments from assistant free text when model emits incomplete submit calls.
+  - Auto-submit one final answer attempt when model returns text-only output without tool calls and a submission tool is available.
+- Added `.opm_train/batches/<batch_id>/openreward_trace.jsonl` to persist per-turn OpenReward request/response/tool events for debugging and audits.
+- Expanded OpenReward regression coverage for tool-schema normalization, missing-answer repair, and text-only auto-submit paths.
 
 ## 2026-03-25
 

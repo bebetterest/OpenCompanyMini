@@ -337,6 +337,7 @@
       "description": "Block until a tool run or agent run reaches the required terminal state.",
       "parameters": {
         "type": "object",
+        "description": "Provide exactly one of tool_run_id or agent_id. Runtime validates this contract.",
         "properties": {
           "tool_run_id": {
             "type": "string",
@@ -347,28 +348,6 @@
             "description": "Target agent id (prefix: agent-)."
           }
         },
-        "oneOf": [
-          {
-            "required": [
-              "tool_run_id"
-            ],
-            "not": {
-              "required": [
-                "agent_id"
-              ]
-            }
-          },
-          {
-            "required": [
-              "agent_id"
-            ],
-            "not": {
-              "required": [
-                "tool_run_id"
-              ]
-            }
-          }
-        ],
         "additionalProperties": false
       }
     }

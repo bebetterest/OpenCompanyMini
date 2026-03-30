@@ -109,6 +109,19 @@ def test_tool_definitions_cancel_agent_has_recursive_flag() -> None:
     assert "recursive" in properties
 
 
+def test_tool_definitions_wait_run_schema_avoids_top_level_combinators() -> None:
+    config = OPMTrainConfig()
+    library = PromptLibrary(default_prompts_dir())
+    tools = tool_definitions_for_role(AgentRole.ROOT, prompt_library=library, config=config)
+    wait_run = _tool_by_name(tools, "wait_run")
+    params = wait_run["function"]["parameters"]  # type: ignore[index]
+    assert params["type"] == "object"
+    assert "oneOf" not in params
+    assert "anyOf" not in params
+    assert "allOf" not in params
+    assert "not" not in params
+
+
 def test_tool_definitions_disallow_additional_properties() -> None:
     config = OPMTrainConfig()
     library = PromptLibrary(default_prompts_dir())

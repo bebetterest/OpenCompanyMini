@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
@@ -25,6 +26,7 @@ _MIXED_DATASET_NAME = "mixed"
 _OPENREWARD_DATASET_NAME = "openreward"
 _OPENREWARD_RESULTS_FILENAME = "openreward_results.jsonl"
 _OPENREWARD_SUMMARY_FILENAME = "openreward_summary.json"
+_OPENREWARD_TRACE_FILENAME = "openreward_trace.jsonl"
 _RowT = TypeVar("_RowT")
 
 
@@ -283,16 +285,19 @@ async def _run_openreward_batch(
     batch_dir = storage.data_root / "batches" / batch_id
     results_path = batch_dir / _OPENREWARD_RESULTS_FILENAME
     summary_path = batch_dir / _OPENREWARD_SUMMARY_FILENAME
+    trace_path = batch_dir / _OPENREWARD_TRACE_FILENAME
 
     existing_rows = _prepare_openreward_output(
         batch_dir=batch_dir,
         results_path=results_path,
         resume=config.resume,
     )
+    _prepare_openreward_trace_output(trace_path=trace_path, resume=config.resume)
     completed_keys = _resume_openreward_completed_keys(existing_rows)
     pending_tasks = [item for item in task_refs if item.task_key not in completed_keys]
 
     append_lock = asyncio.Lock()
+    trace_lock = asyncio.Lock()
     new_rows = await _run_pending_openreward_tasks(
         task_refs=pending_tasks,
         environment=environment,
@@ -305,12 +310,19 @@ async def _run_openreward_batch(
         concurrency=max(1, int(config.concurrency)),
         results_path=results_path,
         append_lock=append_lock,
+        trace_path=trace_path,
+        trace_lock=trace_lock,
         environment_name=str(config.environment or ""),
         variant_name=_optional_str(config.variant),
     )
 
     all_rows = [*existing_rows, *new_rows]
-    summary = _build_openreward_summary(rows=all_rows, results_path=results_path, summary_path=summary_path)
+    summary = _build_openreward_summary(
+        rows=all_rows,
+        results_path=results_path,
+        summary_path=summary_path,
+        trace_path=trace_path,
+    )
     summary_path.write_text(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
     return BatchRunOutput(
@@ -362,6 +374,8 @@ async def _run_pending_openreward_tasks(
     concurrency: int,
     results_path: Path,
     append_lock: asyncio.Lock,
+    trace_path: Path,
+    trace_lock: asyncio.Lock,
     environment_name: str,
     variant_name: str | None,
 ) -> list[OpenRewardBatchItemResult]:
@@ -381,6 +395,8 @@ async def _run_pending_openreward_tasks(
                 max_steps=max_steps,
                 environment_name=environment_name,
                 variant_name=variant_name,
+                trace_path=trace_path,
+                trace_lock=trace_lock,
             )
         )
         for item in task_refs
@@ -509,9 +525,18 @@ async def _run_one_openreward_task(
     max_steps: int,
     environment_name: str,
     variant_name: str | None,
+    trace_path: Path,
+    trace_lock: asyncio.Lock,
 ) -> OpenRewardBatchItemResult:
     """Run one OpenReward task by looping model/tool calls until termination."""
     async with semaphore:
+        trace_context = {
+            "environment": environment_name,
+            "split": task_ref.split,
+            "variant": variant_name,
+            "task_key": task_ref.task_key,
+            "task_index": task_ref.task_index,
+        }
         try:
             outcome = await _run_openreward_session_loop(
                 task=task_ref.task,
@@ -522,6 +547,9 @@ async def _run_one_openreward_task(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 max_steps=max_steps,
+                trace_path=trace_path,
+                trace_lock=trace_lock,
+                trace_context=trace_context,
             )
         except OpenRewardLoopError as exc:
             return OpenRewardBatchItemResult(
@@ -577,12 +605,27 @@ async def _run_openreward_session_loop(
     temperature: float,
     max_tokens: int,
     max_steps: int,
+    trace_path: Path,
+    trace_lock: asyncio.Lock,
+    trace_context: dict[str, Any],
 ) -> OpenRewardLoopOutcome:
     """Execute one OpenReward task loop and return loop-level telemetry."""
     reward_total = 0.0
     finished = False
     tool_calls = 0
     turns = 0
+    auto_submit_attempted = False
+    required_fields_by_tool = _required_tool_fields_by_name(tools)
+    submission_tool_name = _infer_submission_tool_name(tools)
+
+    async def trace(event: str, payload: dict[str, Any]) -> None:
+        await _trace_openreward_event(
+            trace_path=trace_path,
+            trace_lock=trace_lock,
+            trace_context=trace_context,
+            event=event,
+            payload=payload,
+        )
 
     try:
         session_cm = environment.session(task=task)
@@ -590,9 +633,67 @@ async def _run_openreward_session_loop(
             prompt_blocks = await _maybe_await(session.get_prompt())
             prompt_text = _render_prompt_blocks(prompt_blocks)
             messages: list[dict[str, Any]] = [{"role": "user", "content": prompt_text}]
+            await trace(
+                "task_started",
+                {
+                    "model": model_name,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "max_steps": max_steps,
+                    "tool_count": len(tools),
+                    "submission_tool": submission_tool_name,
+                },
+            )
+
+            async def run_tool_call(
+                *,
+                turn: int,
+                tool_name: str,
+                tool_arguments: dict[str, Any],
+                call_id: str,
+                call_event: str = "tool_call",
+            ) -> tuple[float, bool]:
+                await trace(
+                    call_event,
+                    {
+                        "turn": turn,
+                        "tool_name": tool_name,
+                        "arguments": tool_arguments,
+                    },
+                )
+                tool_output = await _maybe_await(session.call_tool(tool_name, tool_arguments))
+                reward, call_finished, tool_content = _observe_openreward_tool_output(tool_output)
+                await trace(
+                    "tool_result",
+                    {
+                        "turn": turn,
+                        "tool_name": tool_name,
+                        "reward": reward,
+                        "finished": call_finished,
+                        "content": tool_content,
+                    },
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": tool_content,
+                    }
+                )
+                return reward, call_finished
 
             while not finished and turns < max_steps:
                 turns += 1
+                request_payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                }
+                await trace("llm_request", {"turn": turns, "request": request_payload})
                 chat_result = await llm_client.stream_chat(
                     model=model_name,
                     messages=messages,
@@ -603,15 +704,47 @@ async def _run_openreward_session_loop(
                     parallel_tool_calls=False,
                 )
                 normalized_tool_calls = _normalize_tool_calls(chat_result.tool_calls)
+                assistant_content = str(chat_result.content or "")
+                await trace(
+                    "llm_response",
+                    {
+                        "turn": turns,
+                        "response": {
+                            "content": assistant_content,
+                            "tool_calls": normalized_tool_calls,
+                            "usage": chat_result.usage,
+                        },
+                    },
+                )
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
-                    "content": str(chat_result.content or ""),
+                    "content": assistant_content,
                 }
                 if normalized_tool_calls:
                     assistant_message["tool_calls"] = normalized_tool_calls
                 messages.append(assistant_message)
 
                 if not normalized_tool_calls:
+                    if (
+                        not auto_submit_attempted
+                        and submission_tool_name
+                        and assistant_content.strip()
+                    ):
+                        auto_submit_attempted = True
+                        tool_calls += 1
+                        auto_answer = _extract_answer_candidate(assistant_content)
+                        auto_arguments = {"answer": auto_answer}
+                        auto_call_id = f"auto-submit-{turns}"
+                        reward_delta, call_finished = await run_tool_call(
+                            turn=turns,
+                            tool_name=submission_tool_name,
+                            tool_arguments=auto_arguments,
+                            call_id=auto_call_id,
+                            call_event="tool_call_auto_submit",
+                        )
+                        reward_total += reward_delta
+                        finished = call_finished
+                        continue
                     break
 
                 for call in normalized_tool_calls:
@@ -623,21 +756,78 @@ async def _run_openreward_session_loop(
                     tool_name = str(function_payload.get("name", "")).strip()
                     if not tool_name:
                         raise ValueError("tool_call missing function name")
-                    tool_arguments = _parse_tool_arguments(function_payload.get("arguments"))
+                    try:
+                        tool_arguments, missing_required, repair_reason = _resolve_openreward_tool_arguments(
+                            tool_name=tool_name,
+                            raw_arguments=function_payload.get("arguments"),
+                            required_fields_by_tool=required_fields_by_tool,
+                            assistant_content=assistant_content,
+                        )
+                    except Exception as exc:
+                        await trace(
+                            "tool_arguments_parse_error",
+                            {
+                                "turn": turns,
+                                "tool_name": tool_name,
+                                "raw_arguments": function_payload.get("arguments"),
+                                "error": f"{type(exc).__name__}:{exc}",
+                            },
+                        )
+                        raise
 
-                    tool_output = await _maybe_await(session.call_tool(tool_name, tool_arguments))
-                    reward_total += _coerce_reward(_object_get(tool_output, "reward"))
-                    finished = bool(_object_get(tool_output, "finished", False))
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": _render_tool_output(tool_output),
-                        }
+                    if repair_reason is not None:
+                        await trace(
+                            "tool_arguments_repaired",
+                            {
+                                "turn": turns,
+                                "tool_name": tool_name,
+                                "repair_reason": repair_reason,
+                                "arguments": tool_arguments,
+                            },
+                        )
+
+                    if missing_required:
+                        tool_error = (
+                            "missing required tool arguments: " + ", ".join(sorted(missing_required))
+                        )
+                        await trace(
+                            "tool_call_rejected",
+                            {
+                                "turn": turns,
+                                "tool_name": tool_name,
+                                "arguments": tool_arguments,
+                                "error": tool_error,
+                            },
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": json.dumps({"error": tool_error}, ensure_ascii=False),
+                            }
+                        )
+                        continue
+
+                    reward_delta, call_finished = await run_tool_call(
+                        turn=turns,
+                        tool_name=tool_name,
+                        tool_arguments=tool_arguments,
+                        call_id=call_id,
                     )
+                    reward_total += reward_delta
+                    finished = call_finished
                     if finished:
                         break
     except Exception as exc:
+        await trace(
+            "task_failed",
+            {
+                "turns": turns,
+                "tool_calls": tool_calls,
+                "reward_total": reward_total,
+                "error": f"{type(exc).__name__}:{exc}",
+            },
+        )
         raise OpenRewardLoopError(
             original_error=exc,
             outcome=OpenRewardLoopOutcome(
@@ -649,6 +839,16 @@ async def _run_openreward_session_loop(
         ) from exc
 
     loop_error = "max_steps_reached" if turns >= max_steps and not finished else None
+    await trace(
+        "task_completed",
+        {
+            "turns": turns,
+            "tool_calls": tool_calls,
+            "reward_total": reward_total,
+            "finished": finished,
+            "error": loop_error,
+        },
+    )
     return OpenRewardLoopOutcome(
         reward_total=reward_total,
         finished=finished,
@@ -889,6 +1089,15 @@ def _prepare_openreward_output(
     )
 
 
+def _prepare_openreward_trace_output(*, trace_path: Path, resume: bool) -> None:
+    """Prepare OpenReward trace JSONL file."""
+    if resume:
+        if not trace_path.exists():
+            trace_path.write_text("", encoding="utf-8")
+        return
+    trace_path.write_text("", encoding="utf-8")
+
+
 def _resume_openreward_completed_keys(rows: list[OpenRewardBatchItemResult]) -> set[str]:
     """Build resume key set, including legacy and split-prefixed compatibility keys."""
     completed: set[str] = set()
@@ -936,6 +1145,42 @@ async def _append_openreward_result_row(
 ) -> None:
     """Append one OpenReward result row to JSONL."""
     await _append_jsonl_object(results_path=results_path, payload=row.to_dict(), append_lock=append_lock)
+
+
+async def _append_openreward_trace_row(
+    *,
+    trace_path: Path,
+    payload: dict[str, Any],
+    append_lock: asyncio.Lock,
+) -> None:
+    """Append one OpenReward trace event row to JSONL."""
+    await _append_jsonl_object(results_path=trace_path, payload=payload, append_lock=append_lock)
+
+
+async def _trace_openreward_event(
+    *,
+    trace_path: Path,
+    trace_lock: asyncio.Lock,
+    trace_context: dict[str, Any],
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    """Append one OpenReward trace event and keep tracing non-fatal."""
+    event_payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": str(event),
+        **trace_context,
+        **payload,
+    }
+    try:
+        await _append_openreward_trace_row(
+            trace_path=trace_path,
+            payload=event_payload,
+            append_lock=trace_lock,
+        )
+    except Exception:
+        # Tracing must never break production task execution.
+        return
 
 
 async def _append_jsonl_object(*, results_path: Path, payload: dict[str, Any], append_lock: asyncio.Lock) -> None:
@@ -1085,6 +1330,7 @@ def _build_openreward_summary(
     rows: list[OpenRewardBatchItemResult],
     results_path: Path,
     summary_path: Path,
+    trace_path: Path,
 ) -> OpenRewardBatchSummary:
     """Build OpenReward aggregate metrics from per-task rows."""
     total = len(rows)
@@ -1103,6 +1349,7 @@ def _build_openreward_summary(
         output_paths={
             "openreward_results_jsonl": str(results_path),
             "openreward_summary_json": str(summary_path),
+            "openreward_trace_jsonl": str(trace_path),
         },
     )
 
@@ -1253,7 +1500,7 @@ def _resolve_openreward_tool_format(*, profile_name: str, override: str | None) 
 def _load_async_openreward_client_cls() -> Any:
     """Load AsyncOpenReward client class lazily so dependency remains optional."""
     try:
-        from openreward import AsyncOpenReward  # type: ignore[import-not-found]
+        from openreward import AsyncOpenReward  # type: ignore[import-untyped]
     except Exception as exc:  # pragma: no cover - exercised via tests with monkeypatch
         raise RuntimeError(
             "OpenReward SDK is not installed. Install optional dependency with: "
@@ -1384,11 +1631,196 @@ async def _list_openreward_tools(*, environment: Any, tool_format: str) -> list[
             raise ValueError("OpenReward environment.list_tools(...) must return a list")
         if not all(isinstance(item, dict) for item in tools):
             raise ValueError("OpenReward environment.list_tools(...) items must be dict payloads")
-        return tools
+        return [_normalize_openreward_tool_definition(item) for item in tools]
 
     if last_shape_error is not None:
         raise last_shape_error
     raise RuntimeError("Unable to list OpenReward tools")
+
+
+def _normalize_openreward_tool_definition(tool: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one OpenReward tool definition into OpenAI-compatible schema."""
+    tool_type = str(tool.get("type", "function") or "function").strip() or "function"
+    if tool_type != "function":
+        return dict(tool)
+
+    root_name = str(tool.get("name", "")).strip()
+    root_description = tool.get("description")
+    root_parameters = tool.get("parameters")
+    root_strict = tool.get("strict")
+
+    function_payload = tool.get("function")
+    if isinstance(function_payload, dict):
+        name = str(function_payload.get("name", root_name)).strip()
+        description = function_payload.get("description", root_description)
+        parameters = function_payload.get("parameters", root_parameters)
+        strict = function_payload.get("strict", root_strict)
+    else:
+        name = root_name
+        description = root_description
+        parameters = root_parameters
+        strict = root_strict
+
+    if not name:
+        raise ValueError("OpenReward tool definition missing function name")
+
+    normalized_function: dict[str, Any] = {"name": name}
+    if description is not None:
+        normalized_function["description"] = description
+    if parameters is not None:
+        normalized_function["parameters"] = parameters
+    if strict is not None:
+        normalized_function["strict"] = strict
+    return {"type": "function", "function": normalized_function}
+
+
+def _required_tool_fields_by_name(tools: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Build map: tool name -> required argument fields from JSON schema."""
+    required_by_name: dict[str, set[str]] = {}
+    for tool in tools:
+        function_payload = tool.get("function")
+        if not isinstance(function_payload, dict):
+            continue
+        tool_name = str(function_payload.get("name", "")).strip()
+        if not tool_name:
+            continue
+        parameters = function_payload.get("parameters")
+        required_fields: set[str] = set()
+        if isinstance(parameters, dict):
+            raw_required = parameters.get("required")
+            if isinstance(raw_required, list):
+                required_fields = {str(item).strip() for item in raw_required if str(item).strip()}
+        required_by_name[tool_name] = required_fields
+    return required_by_name
+
+
+def _missing_required_tool_fields(*, arguments: dict[str, Any], required_fields: set[str]) -> set[str]:
+    """Return required fields that are missing/empty in tool arguments."""
+    missing: set[str] = set()
+    for field in required_fields:
+        if field not in arguments:
+            missing.add(field)
+            continue
+        value = arguments.get(field)
+        if value is None:
+            missing.add(field)
+            continue
+        if isinstance(value, str) and not value.strip():
+            missing.add(field)
+    return missing
+
+
+def _repair_missing_tool_arguments(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    missing_required: set[str],
+    assistant_content: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Try conservative tool-argument repair from current assistant content."""
+    if not missing_required:
+        return arguments, None
+    if missing_required == {"answer"} and assistant_content.strip():
+        candidate = _extract_answer_candidate(assistant_content)
+        if candidate:
+            repaired = dict(arguments)
+            repaired["answer"] = candidate
+            return repaired, f"{tool_name}:filled_answer_from_assistant_content"
+    return arguments, None
+
+
+def _extract_answer_candidate(content: str) -> str:
+    """Extract concise answer candidate from assistant free-text content."""
+    text = str(content or "").strip()
+    if not text:
+        return ""
+
+    answer_line_matches = re.findall(r"(?im)^(?:final answer|answer)\s*[:：]\s*(.+)$", text)
+    if answer_line_matches:
+        return str(answer_line_matches[-1]).strip()
+
+    bold_matches = re.findall(r"\*\*([^*\n]+)\*\*", text)
+    if bold_matches:
+        return str(bold_matches[-1]).strip()
+
+    code_matches = re.findall(r"`([^`\n]+)`", text)
+    if code_matches:
+        return str(code_matches[-1]).strip()
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        tail = lines[-1].lstrip("-* ").strip()
+        if tail:
+            return tail
+    return text
+
+
+def _infer_submission_tool_name(tools: list[dict[str, Any]]) -> str | None:
+    """Infer final-answer submission tool name from normalized tool schemas."""
+    best_candidate: str | None = None
+    for tool in tools:
+        function_payload = tool.get("function")
+        if not isinstance(function_payload, dict):
+            continue
+        tool_name = str(function_payload.get("name", "")).strip()
+        if not tool_name:
+            continue
+        parameters = function_payload.get("parameters")
+        required_fields = set()
+        properties = {}
+        if isinstance(parameters, dict):
+            raw_required = parameters.get("required")
+            if isinstance(raw_required, list):
+                required_fields = {str(item).strip() for item in raw_required if str(item).strip()}
+            raw_properties = parameters.get("properties")
+            if isinstance(raw_properties, dict):
+                properties = raw_properties
+        if required_fields == {"answer"} and "answer" in properties:
+            name_lower = tool_name.lower()
+            if name_lower == "submit":
+                return tool_name
+            if "submit" in name_lower:
+                best_candidate = best_candidate or tool_name
+            elif best_candidate is None:
+                best_candidate = tool_name
+    return best_candidate
+
+
+def _resolve_openreward_tool_arguments(
+    *,
+    tool_name: str,
+    raw_arguments: Any,
+    required_fields_by_tool: dict[str, set[str]],
+    assistant_content: str,
+) -> tuple[dict[str, Any], set[str], str | None]:
+    """Parse + validate + optionally repair one tool-call argument payload."""
+    parsed_arguments = _parse_tool_arguments(raw_arguments)
+    required_fields = required_fields_by_tool.get(tool_name, set())
+    missing_required = _missing_required_tool_fields(
+        arguments=parsed_arguments,
+        required_fields=required_fields,
+    )
+    repaired_arguments, repair_reason = _repair_missing_tool_arguments(
+        tool_name=tool_name,
+        arguments=parsed_arguments,
+        missing_required=missing_required,
+        assistant_content=assistant_content,
+    )
+    if repair_reason is None:
+        return parsed_arguments, missing_required, None
+    repaired_missing_required = _missing_required_tool_fields(
+        arguments=repaired_arguments,
+        required_fields=required_fields,
+    )
+    return repaired_arguments, repaired_missing_required, repair_reason
+
+
+def _observe_openreward_tool_output(tool_output: Any) -> tuple[float, bool, str]:
+    """Normalize tool output into `(reward, finished, rendered_content)` tuple."""
+    reward = _coerce_reward(_object_get(tool_output, "reward"))
+    finished = bool(_object_get(tool_output, "finished", False))
+    rendered_content = _render_tool_output(tool_output)
+    return reward, finished, rendered_content
 
 
 def _build_openreward_task_key(

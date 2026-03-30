@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from unittest import mock
 
+import httpx
 import pytest
 
 from opm_train.llm.openai_compatible import OpenAICompatibleClient, SseParser
 
 
 class FakeStreamResponse:
-    def __init__(self, *, chunks: list[str], status_code: int = 200) -> None:
+    def __init__(self, *, chunks: list[str], status_code: int = 200, error_body: str = "") -> None:
+        request = httpx.Request("POST", "https://example.com/chat/completions")
+        self.request = request
         self._chunks = chunks
         self.status_code = status_code
+        self.reason_phrase = "Bad Request" if status_code == 400 else "OK"
+        self._error_body = error_body
 
     async def __aenter__(self):
         return self
@@ -18,21 +23,18 @@ class FakeStreamResponse:
     async def __aexit__(self, exc_type, exc, tb):
         return None
 
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            import httpx
-
-            request = httpx.Request("POST", "https://example.com")
-            response = httpx.Response(self.status_code, request=request)
-            raise httpx.HTTPStatusError("error", request=request, response=response)
-
     async def aiter_text(self):
         for chunk in self._chunks:
             yield chunk
 
+    async def aread(self) -> bytes:
+        return self._error_body.encode("utf-8")
+
 
 class FakeAsyncClient:
     response_chunks: list[str] = []
+    response_status_code: int = 200
+    response_error_body: str = ""
     last_request: dict[str, object] | None = None
     last_timeout: float | None = None
 
@@ -52,7 +54,11 @@ class FakeAsyncClient:
             "headers": headers,
             "json": json,
         }
-        return FakeStreamResponse(chunks=type(self).response_chunks)
+        return FakeStreamResponse(
+            chunks=type(self).response_chunks,
+            status_code=type(self).response_status_code,
+            error_body=type(self).response_error_body,
+        )
 
 
 def test_sse_parser_handles_chunked_events() -> None:
@@ -97,6 +103,8 @@ async def test_stream_chat_sends_tool_fields_and_parses_calls() -> None:
         'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ho hi\\"}"}}]}}]}\n\n',
         "data: [DONE]\n\n",
     ]
+    FakeAsyncClient.response_status_code = 200
+    FakeAsyncClient.response_error_body = ""
 
     with mock.patch("httpx.AsyncClient", FakeAsyncClient):
         result = await client.stream_chat(
@@ -121,3 +129,30 @@ async def test_stream_chat_sends_tool_fields_and_parses_calls() -> None:
     assert payload["tools"][0]["function"]["name"] == "shell"  # type: ignore[index]
     assert payload["tool_choice"] == "auto"  # type: ignore[index]
     assert payload["parallel_tool_calls"] is False  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_http_status_error_includes_response_body() -> None:
+    client = OpenAICompatibleClient(
+        base_url="https://example.com/v1",
+        api_key="test-key",
+        timeout_seconds=30,
+        max_retries=0,
+        retry_backoff_seconds=0.0,
+    )
+    FakeAsyncClient.response_chunks = []
+    FakeAsyncClient.response_status_code = 400
+    FakeAsyncClient.response_error_body = '{"error":{"message":"invalid_function_parameters"}}'
+
+    with mock.patch("httpx.AsyncClient", FakeAsyncClient):
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            await client.stream_chat(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "test"}],
+                temperature=0.1,
+                max_tokens=128,
+            )
+
+    message = str(exc_info.value)
+    assert "response_body=" in message
+    assert "invalid_function_parameters" in message
