@@ -269,6 +269,7 @@ Note: the JSONL loader streams physical lines (instead of using `splitlines()`),
   - Default: disabled (`tool_output_truncate_enabled = false`)
   - Optional cap: `tool_output_truncate_max_chars` (effective only when truncation is enabled)
   - Trace metadata: `openreward_trace.jsonl` records `content_chars` and `content_truncated`
+    (`content_truncated=true` when runtime truncates output, or when upstream tool output is already marked truncated)
 - Results/summary use OpenReward-specific fields (reward-based), persisted to:
   - `openreward_results.jsonl`
   - `openreward_summary.json`

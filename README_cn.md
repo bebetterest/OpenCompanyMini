@@ -269,6 +269,7 @@ PY
   - 默认关闭（`tool_output_truncate_enabled = false`）
   - 可设置长度上限 `tool_output_truncate_max_chars`（仅在开启截断时生效）
   - `openreward_trace.jsonl` 会记录 `content_chars` 与 `content_truncated`
+    （当运行时执行截断，或上游工具输出已带截断标记时，`content_truncated=true`）
 - 结果输出采用 OpenReward 专用奖励语义，产物文件：
   - `openreward_results.jsonl`
   - `openreward_summary.json`

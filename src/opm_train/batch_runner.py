@@ -1864,14 +1864,19 @@ def _observe_openreward_tool_output(
     finished = bool(_object_get(tool_output, "finished", False))
     rendered_content = str(_render_tool_output(tool_output) or "")
     content_chars = len(rendered_content)
+    source_truncated = _is_openreward_tool_output_pre_truncated(
+        tool_output=tool_output,
+        rendered_content=rendered_content,
+    )
     if truncate_enabled:
-        bounded_content, was_truncated = _truncate_openreward_tool_content(
+        bounded_content, runtime_truncated = _truncate_openreward_tool_content(
             rendered_content,
             max_chars=max(1, int(truncate_max_chars)),
         )
     else:
         bounded_content = rendered_content
-        was_truncated = False
+        runtime_truncated = False
+    was_truncated = bool(runtime_truncated or source_truncated)
     return reward, finished, bounded_content, content_chars, was_truncated
 
 
@@ -2010,6 +2015,28 @@ def _truncate_openreward_tool_content(content: str, *, max_chars: int) -> tuple[
     return bounded, True
 
 
+def _is_openreward_tool_output_pre_truncated(*, tool_output: Any, rendered_content: str) -> bool:
+    """Best-effort detection for tool outputs already truncated by upstream runtime/tooling."""
+    for key in ("truncated", "is_truncated", "content_truncated"):
+        if _coerce_bool(_object_get(tool_output, key)):
+            return True
+
+    blocks = _object_get(tool_output, "blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            for key in ("truncated", "is_truncated", "content_truncated"):
+                if _coerce_bool(_object_get(block, key)):
+                    return True
+
+    text = str(rendered_content or "").lower()
+    marker_patterns = (
+        "(truncated, output exceeded limit)",
+        "output truncated",
+        "[truncated",
+    )
+    return any(pattern in text for pattern in marker_patterns)
+
+
 def _coerce_reward(value: Any) -> float:
     """Normalize reward scalar into float value."""
     if value is None:
@@ -2018,6 +2045,18 @@ def _coerce_reward(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Normalize common bool-like payloads used by external tool outputs."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized in {"1", "true", "yes", "y", "on"}
+    return False
 
 
 def _object_get(value: Any, key: str, default: Any = None) -> Any:

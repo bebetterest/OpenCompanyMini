@@ -160,6 +160,25 @@ class _LargeOutputOpenRewardEnvironment(_RequiredAnswerOpenRewardEnvironment):
         return _LargeOutputOpenRewardSession(task=task, never_finish=False)
 
 
+class _PreTruncatedOutputOpenRewardSession(_FakeOpenRewardSession):
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> _FakeToolOutput:
+        self.call_count += 1
+        _ = arguments
+        if name != "answer":
+            return _FakeToolOutput(text="unknown", reward=0.0, finished=False)
+        return _FakeToolOutput(
+            text="...(truncated, output exceeded limit)\npartial payload\n(exit 141)",
+            reward=1.0,
+            finished=True,
+        )
+
+
+class _PreTruncatedOutputOpenRewardEnvironment(_RequiredAnswerOpenRewardEnvironment):
+    def session(self, *, task: dict[str, object]) -> _PreTruncatedOutputOpenRewardSession:
+        self.session_count += 1
+        return _PreTruncatedOutputOpenRewardSession(task=task, never_finish=False)
+
+
 def _patch_openreward_client(monkeypatch: pytest.MonkeyPatch, environment: object) -> None:
     class _ClientFactory:
         def __init__(self) -> None:
@@ -959,6 +978,21 @@ def test_observe_openreward_tool_output_keeps_large_payload_when_truncation_disa
     assert bounded == raw_text
 
 
+def test_observe_openreward_tool_output_marks_pre_truncated_payload() -> None:
+    raw_text = "...(truncated, output exceeded limit)\nchunk\n(exit 141)"
+    tool_output = _FakeToolOutput(text=raw_text, reward=0.25, finished=False)
+    reward, finished, bounded, content_chars, truncated = batch_runner_module._observe_openreward_tool_output(
+        tool_output,
+        truncate_enabled=False,
+        truncate_max_chars=32,
+    )
+    assert reward == 0.25
+    assert finished is False
+    assert content_chars == len(raw_text)
+    assert truncated is True
+    assert bounded == raw_text
+
+
 @pytest.mark.asyncio
 async def test_run_batch_openreward_repairs_missing_answer_argument(monkeypatch: pytest.MonkeyPatch) -> None:
     with TemporaryDirectory() as temp_dir:
@@ -1152,3 +1186,35 @@ async def test_run_batch_openreward_tool_output_truncation_from_runtime_config(
         assert tool_result["content_truncated"] is True
         assert len(str(tool_result["content"])) <= 128
         assert "output truncated" in str(tool_result["content"])
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_trace_marks_pre_truncated_tool_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        environment = _PreTruncatedOutputOpenRewardEnvironment([{"task_id": "t1", "answer": "42"}])
+        _patch_openreward_client(monkeypatch, environment)
+        monkeypatch.setattr(batch_runner_module, "_build_openreward_llm_client", lambda profile: _FakeOpenRewardLLM())
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+            )
+        )
+
+        trace_events = [
+            json.loads(line)
+            for line in (output.batch_dir / "openreward_trace.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        tool_result = next(item for item in trace_events if item.get("event") == "tool_result")
+        assert tool_result["content_truncated"] is True
+        assert "(truncated, output exceeded limit)" in str(tool_result["content"])
