@@ -87,7 +87,7 @@ def _default_specs() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="wait_run",
-            executor=_method_executor("_tool_wait_run", include_action=True),
+            executor=_method_executor("_tool_wait_run", include_run=True, include_action=True),
         ),
         ToolSpec(
             name="cancel_tool_run",
@@ -95,7 +95,7 @@ def _default_specs() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="wait_time",
-            executor=_method_executor("_tool_wait_time", include_action=True),
+            executor=_method_executor("_tool_wait_time", include_run=True, include_action=True),
         ),
         ToolSpec(
             name="list_mcp_servers",

@@ -138,7 +138,14 @@ Before `resume`, runtime performs strict snapshot/event-tail validation (contigu
 Rules:
 
 - `--step` requires `--agent-id`.
-- `--mode sft` emits OpenAI-messages style rows, using only the final successful protocol attempt per turn.
+- `--mode sft` emits one row per turn using the final successful protocol attempt.
+  - Backward-compatible `target` is preserved as action-supervision payload (`{"actions":[...]}`).
+  - Additional fields are exported for traceability and richer training:
+    - `messages_complete`: request `messages` plus full assistant response.
+    - `assistant_response`: includes `content`, optional `reasoning`, `tool_calls`, `usage`, and `raw_events` when available.
+    - `metadata.inference_*`: provider/model/endpoint/parameter metadata.
+    - `environment`: session task/project/provider profile + full `config_snapshot`.
+    - `traceability`: `llm_sequence`, request/response artifact paths, event-seq range, and turn timestamps.
 - Export requires snapshot `schema_version >= 4` (older sessions are rejected).
 
 ## SFT Workflow
@@ -270,10 +277,16 @@ Note: the JSONL loader streams physical lines (instead of using `splitlines()`),
   - Optional cap: `tool_output_truncate_max_chars` (effective only when truncation is enabled)
   - Trace metadata: `openreward_trace.jsonl` records `content_chars` and `content_truncated`
     (`content_truncated=true` when runtime truncates output, or when upstream tool output is already marked truncated)
+  - Trace rows also carry end-to-end traceability fields, including:
+    - batch/provider/model metadata (`batch_id`, `provider_profile`, `inference_*`, tool format, selector settings)
+    - environment/task lineage (`openreward_environment`, `variant`, `task_key/task_index/task_id`, per-task `trace_session_id`)
+    - per-turn request/response details (`llm_request`, `llm_response`, `reasoning`, `raw_events`, `trace_event_seq`)
 - Results/summary use OpenReward-specific fields (reward-based), persisted to:
   - `openreward_results.jsonl`
   - `openreward_summary.json`
   - `openreward_trace.jsonl`
+- `openreward_results.jsonl` rows include stable per-task `session_id` (same value format as trace `trace_session_id`: `<batch_id>:<split>:<task_key>`), plus
+  `environment/split/variant/task_key/task_index/reward_total/finished/tool_calls/turns/session_status/error`.
 
 OfficeQA example (single task):
 
@@ -362,9 +375,10 @@ Edit `opm_train.toml`:
 - Provider profile routing (`openrouter`, `tinker`, `custom`) via one OpenAI-compatible client.
 - Default `provider.tinker.base_url` is set to Tinker OpenAI-compatible inference endpoint:
   `https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1`.
-- `provider.tinker.model` should be a Tinker sampler path (`tinker://.../sampler_weights/...`), or override via `--model` in `run/resume/batch-run`.
+- Default model for all provider profiles is `qwen/qwen3.6-plus-preview:free`; override per profile or via `--model` in `run/resume/batch-run` when needed.
 - Runtime limits (`max_children_per_agent`, `max_active_agents`, step budgets).
-- Protocol retry controls for invalid model payloads (`max_protocol_retries`, `protocol_retry_backoff_seconds`).
+- Protocol retry controls for invalid model payloads (`max_protocol_retries`, `protocol_retry_backoff_seconds`) plus independent context-overflow retry budget (`max_context_overflow_retries`).
+- Per-turn retry metrics are persisted in `turns.jsonl` (`overall_retries`, API/network retries, empty-stream retries, parse retries, parse-empty retries, context-overflow retries).
 - Runtime tools and context compression thresholds.
 - Global tool-output replay controls under `[runtime.context]`:
   - `tool_output_truncate_enabled` (default `false`)

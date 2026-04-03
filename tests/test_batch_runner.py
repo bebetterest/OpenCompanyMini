@@ -638,6 +638,8 @@ async def test_run_batch_openreward_writes_openreward_artifacts(monkeypatch: pyt
         assert len(rows) == 2
         assert {row["task_key"] for row in rows} == {"t1", "t2"}
         assert {row["session_status"] for row in rows} == {"completed"}
+        assert all(isinstance(row.get("session_id"), str) and row["session_id"] for row in rows)
+        assert all(row["session_id"].endswith(f":train:{row['task_key']}") for row in rows)
 
 
 @pytest.mark.asyncio
@@ -1218,3 +1220,83 @@ async def test_run_batch_openreward_trace_marks_pre_truncated_tool_output(
         tool_result = next(item for item in trace_events if item.get("event") == "tool_result")
         assert tool_result["content_truncated"] is True
         assert "(truncated, output exceeded limit)" in str(tool_result["content"])
+
+
+@pytest.mark.asyncio
+async def test_run_batch_openreward_trace_includes_traceability_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TemporaryDirectory() as temp_dir:
+        app_dir = Path(temp_dir)
+        environment = _RequiredAnswerOpenRewardEnvironment([{"task_id": "t1", "answer": "42", "domain": "officeqa"}])
+        _patch_openreward_client(monkeypatch, environment)
+
+        class _TraceRichLLM:
+            async def stream_chat(self, **kwargs: object) -> ChatResult:
+                _ = kwargs
+                return ChatResult(
+                    content="draft answer",
+                    reasoning="reasoning trace",
+                    raw_events=[{"chunk": 1}],
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "answer", "arguments": json.dumps({"answer": "42"})},
+                        }
+                    ],
+                )
+
+        monkeypatch.setattr(
+            batch_runner_module,
+            "_build_openreward_llm_client",
+            lambda profile: _TraceRichLLM(),
+        )
+
+        output = await run_batch(
+            BatchRunConfig(
+                dataset="openreward",
+                input_path=None,
+                project_dir=app_dir,
+                app_dir=app_dir,
+                environment="GeneralReasoning/OfficeQA",
+                split="train",
+                task_index=0,
+                provider_profile="openrouter",
+                model="qwen/test-trace",
+                batch_id="openreward-trace-rich",
+            )
+        )
+
+        trace_events = [
+            json.loads(line)
+            for line in (output.batch_dir / "openreward_trace.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        task_started = next(item for item in trace_events if item.get("event") == "task_started")
+        llm_request = next(item for item in trace_events if item.get("event") == "llm_request")
+        llm_response = next(item for item in trace_events if item.get("event") == "llm_response")
+
+        assert llm_request["trace_schema_version"] == 2
+        assert llm_request["dataset"] == "openreward"
+        assert llm_request["batch_id"] == "openreward-trace-rich"
+        assert llm_request["inference_provider"] == "openrouter"
+        assert llm_request["inference_model"] == "qwen/test-trace"
+        assert isinstance(llm_request["inference_parameters"], dict)
+        assert llm_request["inference_parameters"]["parallel_tool_calls"] is False
+        assert llm_request["openreward_environment"] == "GeneralReasoning/OfficeQA"
+        assert isinstance(llm_request["task_selector"], dict)
+        assert llm_request["task_selector"]["task_index"] == 0
+        assert isinstance(llm_request["trace_event_seq"], int)
+        assert llm_request["trace_session_id"].endswith(":train:t1")
+        assert isinstance(llm_request["request"], dict)
+        assert isinstance(llm_request["request"]["messages"], list)
+
+        assert isinstance(task_started["task_payload"], dict)
+        assert task_started["task_payload"]["task_id"] == "t1"
+        assert isinstance(task_started["prompt_blocks"], list)
+        assert isinstance(task_started["tools"], list)
+
+        assert llm_response["response"]["reasoning"] == "reasoning trace"
+        assert isinstance(llm_response["response"]["raw_events"], list)
+        assert llm_response["response"]["tool_calls"][0]["function"]["name"] == "answer"

@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from opm_train.llm import ChatResult
-from opm_train.models import AgentNode, AgentRole, AgentStatus
+from opm_train.models import AgentNode, AgentRole, AgentStatus, ToolRun
 from opm_train.orchestrator import RuntimeOrchestrator
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -40,6 +40,29 @@ def _extract_last_tool_payload(messages: list[dict[str, Any]]) -> dict[str, Any]
         if isinstance(payload, dict):
             return payload
     return {}
+
+
+def _find_root_agent_id_from_runs(payload: dict[str, Any]) -> str:
+    runs = payload.get("agent_runs")
+    if not isinstance(runs, list):
+        return ""
+    for row in runs:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("role", "")).strip() == "root":
+            return str(row.get("id", "")).strip()
+    return ""
+
+
+def _new_wait_request_run(orchestrator: RuntimeOrchestrator, agent: AgentNode, *, tool_name: str) -> ToolRun:
+    request_run = orchestrator._create_tool_run(
+        agent=agent,
+        tool_name=tool_name,
+        arguments={"type": tool_name},
+        blocking=True,
+    )
+    orchestrator._mark_tool_run_running(request_run)
+    return request_run
 
 
 class BlockingSpawnLLM:
@@ -302,6 +325,107 @@ class SteerAndCancelLLM:
             )
         else:
             text = json.dumps({"actions": [{"type": "list_agent_runs", "limit": 1}]})
+        return ChatResult(content=text, raw_events=[])
+
+
+class WaitInterruptedBySteerLLM:
+    def __init__(self) -> None:
+        self.root_calls = 0
+        self.worker_calls = 0
+        self.spawn_run_id = ""
+        self.wait_time_interrupted = False
+        self.root_received_steer = False
+
+    async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        messages = kwargs["messages"]
+        route = _route(messages)
+        if route == "root":
+            self.root_calls += 1
+            tool_payload = _extract_last_tool_payload(messages)
+            if "interrupt root wait" in json.dumps(messages, ensure_ascii=False):
+                self.root_received_steer = True
+            if self.root_calls == 1:
+                text = json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "type": "spawn_agent",
+                                "name": "SteerRoot",
+                                "instruction": "steer root while it waits",
+                            }
+                        ]
+                    }
+                )
+            elif self.root_calls == 2:
+                self.spawn_run_id = str(tool_payload.get("tool_run_id", "")).strip()
+                text = json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "type": "wait_time",
+                                "seconds": 10,
+                            }
+                        ]
+                    }
+                )
+            elif self.root_calls == 3:
+                self.wait_time_interrupted = bool(tool_payload.get("interrupted_by_steer", False)) and str(
+                    tool_payload.get("end_reason", "")
+                ) == "received_steer_message"
+                text = json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "type": "wait_run",
+                                "tool_run_id": self.spawn_run_id,
+                            }
+                        ]
+                    }
+                )
+            else:
+                text = json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "type": "finish",
+                                "status": "completed",
+                                "summary": "wait interrupted and steering consumed",
+                            }
+                        ]
+                    }
+                )
+            return ChatResult(content=text, raw_events=[])
+
+        self.worker_calls += 1
+        tool_payload = _extract_last_tool_payload(messages)
+        if self.worker_calls == 1:
+            text = json.dumps({"actions": [{"type": "list_agent_runs", "limit": 5}]})
+        elif self.worker_calls == 2:
+            root_id = _find_root_agent_id_from_runs(tool_payload)
+            text = json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "steer_agent",
+                            "agent_id": root_id,
+                            "content": "interrupt root wait",
+                        }
+                    ]
+                }
+            )
+        else:
+            text = json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "completed",
+                            "summary": "steer sent",
+                            "next_recommendation": "none",
+                        }
+                    ]
+                }
+            )
         return ChatResult(content=text, raw_events=[])
 
 
@@ -729,6 +853,56 @@ class RetryAlwaysInvalidLLM:
         return ChatResult(content="still invalid payload", raw_events=[])
 
 
+class RetryInvalidJsonCapturePromptLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.retry_prompt = ""
+
+    async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        self.calls += 1
+        messages = kwargs["messages"]
+        if self.calls == 1:
+            return ChatResult(content="this is not json", raw_events=[])
+        self.retry_prompt = str(messages[-1].get("content", "")) if messages else ""
+        return ChatResult(
+            content=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "completed",
+                            "summary": "retry prompt captured",
+                        }
+                    ]
+                }
+            ),
+            raw_events=[],
+        )
+
+
+def test_invalid_model_response_actions_worker_recommends_review_before_planning() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        worker = AgentNode(
+            id="agent-worker",
+            session_id="session-test",
+            name="Worker",
+            role=AgentRole.WORKER,
+            instruction="Do work",
+            workspace_path=project,
+        )
+
+        assert orchestrator._invalid_model_response_actions(worker) == [
+            {
+                "type": "finish",
+                "status": "failed",
+                "summary": "Model returned invalid action payload.",
+                "next_recommendation": "First review this agent's progress, then plan and execute next actions.",
+            }
+        ]
+
+
 class ManualCompressAndChineseLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -812,6 +986,18 @@ async def test_steer_and_cancel_flow() -> None:
         child_agents = [agent for agent in orchestrator.agents.values() if agent.parent_agent_id]
         assert child_agents
         assert child_agents[0].status in {AgentStatus.CANCELLED, AgentStatus.FAILED, AgentStatus.COMPLETED}
+
+
+@pytest.mark.asyncio
+async def test_wait_time_interrupted_by_steer_then_continue_generation() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = WaitInterruptedBySteerLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        session = await orchestrator.run_task("wait interrupt test")
+        assert session.status.value == "completed"
+        assert llm.wait_time_interrupted is True
+        assert llm.root_received_steer is True
 
 
 @pytest.mark.asyncio
@@ -962,9 +1148,68 @@ async def test_wait_run_rejects_timeout_field() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
-        result = await orchestrator._tool_wait_run({"tool_run_id": "toolrun-1", "timeout_seconds": "abc"})
+        requester = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="wait run",
+            workspace_path=project,
+        )
+        request_run = _new_wait_request_run(orchestrator, requester, tool_name="wait_run")
+        result = await orchestrator._tool_wait_run(request_run, {"tool_run_id": "toolrun-1", "timeout_seconds": "abc"})
         assert result["wait_run_status"] is False
         assert "unsupported field(s)" in str(result.get("error", ""))
+
+
+@pytest.mark.asyncio
+async def test_wait_run_returns_steer_interrupt_reason_when_requester_has_pending_steer() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        agent = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="wait run",
+            workspace_path=project,
+        )
+        run = orchestrator._create_tool_run(
+            agent=agent,
+            tool_name="shell",
+            arguments={"type": "shell", "command": "sleep 1"},
+            blocking=False,
+        )
+        orchestrator._mark_tool_run_running(run)
+        orchestrator.pending_steers[agent.id] = ["interrupt now"]
+        request_run = _new_wait_request_run(orchestrator, agent, tool_name="wait_run")
+
+        result = await orchestrator._tool_wait_run(request_run, {"tool_run_id": run.id})
+        assert result["wait_run_status"] is True
+        assert result["interrupted_by_steer"] is True
+        assert result["end_reason"] == "received_steer_message"
+
+
+@pytest.mark.asyncio
+async def test_wait_time_returns_steer_interrupt_reason_when_requester_has_pending_steer() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        agent = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="wait time",
+            workspace_path=project,
+        )
+        orchestrator.pending_steers[agent.id] = ["interrupt now"]
+        request_run = _new_wait_request_run(orchestrator, agent, tool_name="wait_time")
+        result = await orchestrator._tool_wait_time(request_run, {"seconds": 10})
+        assert result["wait_time_status"] is True
+        assert result["interrupted_by_steer"] is True
+        assert result["end_reason"] == "received_steer_message"
 
 
 @pytest.mark.asyncio
@@ -988,10 +1233,11 @@ async def test_wait_run_requires_exactly_one_target_and_returns_terminal_status(
         )
         orchestrator._mark_tool_run_running(run)
         orchestrator._complete_tool_run(run, result={"exit_code": 0})
-        invalid = await orchestrator._tool_wait_run({})
+        request_run = _new_wait_request_run(orchestrator, agent, tool_name="wait_run")
+        invalid = await orchestrator._tool_wait_run(request_run, {})
         assert invalid["wait_run_status"] is False
         assert "requires exactly one of 'tool_run_id' or 'agent_id'" in str(invalid.get("error", ""))
-        result = await orchestrator._tool_wait_run({"tool_run_id": run.id})
+        result = await orchestrator._tool_wait_run(request_run, {"tool_run_id": run.id})
         assert result["wait_run_status"] is True
 
 
@@ -1198,7 +1444,8 @@ async def test_shell_exceeds_inline_wait_then_get_tool_run_shows_cumulative_outp
             await asyncio.sleep(0.01)
         assert "start" in stdout_seen
 
-        wait_result = await orchestrator._tool_wait_run({"tool_run_id": run.id})
+        wait_request_run = _new_wait_request_run(orchestrator, agent, tool_name="wait_run")
+        wait_result = await orchestrator._tool_wait_run(wait_request_run, {"tool_run_id": run.id})
         assert wait_result["wait_run_status"] is True
         final_detail = orchestrator._tool_get_tool_run({"tool_run_id": run.id, "include_result": True})
         assert "end" in str((((final_detail.get("tool_run") or {}).get("result") or {}).get("stdout", "")))
@@ -1400,6 +1647,22 @@ async def test_protocol_retry_exhaustion_falls_back_to_invalid_payload_finish() 
 
 
 @pytest.mark.asyncio
+async def test_protocol_retry_message_uses_invalid_response_with_error_details() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = RetryInvalidJsonCapturePromptLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        orchestrator.config.runtime.limits.max_protocol_retries = 1
+        session = await orchestrator.run_task("retry invalid json prompt")
+        assert session.status.value == "completed"
+        assert session.final_summary == "retry prompt captured"
+        assert llm.calls == 2
+        assert "Error: No JSON object found in model response" in llm.retry_prompt
+        assert "Fix guidance:" in llm.retry_prompt
+        assert "Retry 2/2." in llm.retry_prompt
+
+
+@pytest.mark.asyncio
 async def test_turn_index_records_step_attempts_and_llm_events() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
@@ -1432,6 +1695,26 @@ async def test_turn_index_records_step_attempts_and_llm_events() -> None:
         assert "agent_step_finished" in event_types
         assert "llm_call_request_recorded" in event_types
         assert "llm_call_response_recorded" in event_types
+
+
+@pytest.mark.asyncio
+async def test_turn_retry_metrics_records_protocol_retry_counters() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = RetryInvalidJsonThenSuccessLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        orchestrator.config.runtime.limits.max_protocol_retries = 1
+        session = await orchestrator.run_task("turn retry metrics")
+        assert session.status.value == "completed"
+
+        turns = orchestrator.storage.load_turns(session.id)
+        assert len(turns) == 1
+        metrics = turns[0].get("retry_metrics")
+        assert isinstance(metrics, dict)
+        assert int(metrics.get("overall_retries", 0) or 0) == 1
+        assert int(metrics.get("parse_retries", 0) or 0) == 1
+        assert int(metrics.get("parse_empty_retries", 0) or 0) == 1
+        assert int(metrics.get("context_overflow_retries", 0) or 0) == 0
 
 
 @pytest.mark.asyncio

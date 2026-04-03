@@ -62,6 +62,7 @@ def test_load_runtime_limits_protocol_retry_fields() -> None:
                     "[runtime.limits]",
                     "max_protocol_retries = 4",
                     "protocol_retry_backoff_seconds = 0.6",
+                    "max_context_overflow_retries = 3",
                 ]
             ),
             encoding="utf-8",
@@ -69,6 +70,7 @@ def test_load_runtime_limits_protocol_retry_fields() -> None:
         config = OPMTrainConfig.load(app_dir)
         assert config.runtime.limits.max_protocol_retries == 4
         assert config.runtime.limits.protocol_retry_backoff_seconds == 0.6
+        assert config.runtime.limits.max_context_overflow_retries == 3
 
 
 def test_runtime_context_defaults_tool_output_truncation_disabled() -> None:
@@ -129,4 +131,4 @@ def test_default_tinker_profile_matches_openai_compatible_inference_endpoint() -
     config = OPMTrainConfig()
     profile = config.provider.tinker
     assert profile.base_url == "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
-    assert profile.model.startswith("tinker://")
+    assert profile.model == "qwen/qwen3.6-plus-preview:free"

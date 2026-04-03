@@ -16,6 +16,10 @@ TokenCallback = Callable[[str], Awaitable[None] | None]
 RetryCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
+class EmptyStreamError(RuntimeError):
+    """Raised when provider stream ends without any SSE payload event."""
+
+
 class SseParser:
     """Incremental parser for ``data:`` framed SSE payloads."""
 
@@ -157,6 +161,8 @@ class OpenAICompatibleClient:
                                 if isinstance(tool_calls, list):
                                     for raw_call in tool_calls:
                                         _merge_tool_call_delta(tool_call_parts, raw_call)
+                if not received_event:
+                    raise EmptyStreamError("Provider stream ended without any SSE events.")
                 return ChatResult(
                     content="".join(content_parts),
                     reasoning="".join(reasoning_parts),
@@ -165,13 +171,13 @@ class OpenAICompatibleClient:
                     usage=usage,
                 )
             except Exception as exc:
-                should_retry = self._should_retry(
+                retry_reason = self._retry_reason(
                     exc=exc,
                     attempt=attempt,
                     max_attempts=max_attempts,
                     has_partial_output=received_event,
                 )
-                if not should_retry:
+                if retry_reason is None:
                     raise
                 wait_seconds = self._retry_delay(attempt)
                 if on_retry is not None:
@@ -179,31 +185,36 @@ class OpenAICompatibleClient:
                         "attempt": attempt + 1,
                         "max_attempts": max_attempts,
                         "wait_seconds": wait_seconds,
+                        "reason": retry_reason,
+                        "error_type": type(exc).__name__,
                         "error": str(exc),
                     }
                     await _maybe_await(on_retry(payload_retry))
                 await asyncio.sleep(wait_seconds)
         raise RuntimeError("stream_chat exhausted retry budget")
 
-    def _should_retry(
+    def _retry_reason(
         self,
         *,
         exc: Exception,
         attempt: int,
         max_attempts: int,
         has_partial_output: bool,
-    ) -> bool:
-        """Return whether failed request should be retried."""
+    ) -> str | None:
+        """Classify retryable errors and return reason code when retry is allowed."""
         if attempt + 1 >= max_attempts:
-            return False
+            return None
+        if isinstance(exc, EmptyStreamError):
+            return "empty_stream"
         if has_partial_output:
-            return False
+            return None
         if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
-            return True
+            return "api_or_network"
         if isinstance(exc, httpx.HTTPStatusError):
             code = int(exc.response.status_code)
-            return code >= 429
-        return False
+            if code >= 429:
+                return "api_or_network"
+        return None
 
     def _retry_delay(self, attempt: int) -> float:
         """Compute exponential backoff with bounded random jitter."""

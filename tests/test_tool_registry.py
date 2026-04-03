@@ -46,8 +46,8 @@ def test_tool_registry_executor_argument_binding() -> None:
             calls.append(("spawn_agent", (run_obj, agent_obj, action_obj)))
             return {"kind": "spawn_agent"}
 
-        def _tool_wait_time(self, action_obj: object) -> dict[str, str]:
-            calls.append(("wait_time", (action_obj,)))
+        def _tool_wait_time(self, run_obj: object, action_obj: object) -> dict[str, str]:
+            calls.append(("wait_time", (run_obj, action_obj)))
             return {"kind": "wait_time"}
 
         def _tool_compress_context(self, agent_obj: object) -> dict[str, str]:
@@ -63,6 +63,6 @@ def test_tool_registry_executor_argument_binding() -> None:
     assert calls == [
         ("shell", (run, action)),
         ("spawn_agent", (run, agent, action)),
-        ("wait_time", (action,)),
+        ("wait_time", (run, action)),
         ("compress_context", (agent,)),
     ]

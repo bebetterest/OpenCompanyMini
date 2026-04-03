@@ -20,7 +20,7 @@ from opm_train.llm import OpenAICompatibleClient
 from opm_train.models import RunSession, SessionStatus
 from opm_train.orchestrator import RuntimeOrchestrator
 from opm_train.storage import SessionStorage
-from opm_train.utils import ensure_directory
+from opm_train.utils import ensure_directory, json_ready
 
 _MIXED_DATASET_NAME = "mixed"
 _OPENREWARD_DATASET_NAME = "openreward"
@@ -73,6 +73,7 @@ class OpenRewardBatchItemResult:
     tool_calls: int
     turns: int
     session_status: str
+    session_id: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -315,6 +316,14 @@ async def _run_openreward_batch(
         trace_lock=trace_lock,
         environment_name=str(config.environment or ""),
         variant_name=_optional_str(config.variant),
+        trace_common_context=_openreward_trace_common_context(
+            config=config,
+            batch_id=batch_id,
+            profile_name=profile_name,
+            profile=provider_profile,
+            model_name=model_name,
+            tool_format=tool_format,
+        ),
         tool_output_truncate_enabled=bool(runtime_config.runtime.context.tool_output_truncate_enabled),
         tool_output_truncate_max_chars=max(
             1,
@@ -387,6 +396,7 @@ async def _run_pending_openreward_tasks(
     trace_lock: asyncio.Lock,
     environment_name: str,
     variant_name: str | None,
+    trace_common_context: dict[str, Any],
     tool_output_truncate_enabled: bool,
     tool_output_truncate_max_chars: int,
 ) -> list[OpenRewardBatchItemResult]:
@@ -410,6 +420,7 @@ async def _run_pending_openreward_tasks(
                 trace_lock=trace_lock,
                 tool_output_truncate_enabled=tool_output_truncate_enabled,
                 tool_output_truncate_max_chars=tool_output_truncate_max_chars,
+                trace_common_context=trace_common_context,
             )
         )
         for item in task_refs
@@ -540,17 +551,26 @@ async def _run_one_openreward_task(
     variant_name: str | None,
     trace_path: Path,
     trace_lock: asyncio.Lock,
+    trace_common_context: dict[str, Any],
     tool_output_truncate_enabled: bool,
     tool_output_truncate_max_chars: int,
 ) -> OpenRewardBatchItemResult:
     """Run one OpenReward task by looping model/tool calls until termination."""
     async with semaphore:
+        session_id = _openreward_trace_session_id(
+            batch_id=str(trace_common_context.get("batch_id", "")),
+            split=task_ref.split,
+            task_key=task_ref.task_key,
+        )
         trace_context = {
+            **trace_common_context,
             "environment": environment_name,
             "split": task_ref.split,
             "variant": variant_name,
             "task_key": task_ref.task_key,
             "task_index": task_ref.task_index,
+            "task_id": _extract_task_id(task_ref.task),
+            "trace_session_id": session_id,
         }
         try:
             outcome = await _run_openreward_session_loop(
@@ -579,6 +599,7 @@ async def _run_one_openreward_task(
                 finished=False,
                 tool_calls=exc.outcome.tool_calls,
                 turns=exc.outcome.turns,
+                session_id=session_id,
                 session_status="failed",
                 error=f"run_error:{type(exc.original_error).__name__}:{exc.original_error}",
             )
@@ -593,6 +614,7 @@ async def _run_one_openreward_task(
                 finished=False,
                 tool_calls=0,
                 turns=0,
+                session_id=session_id,
                 session_status="failed",
                 error=f"run_error:{type(exc).__name__}:{exc}",
             )
@@ -607,6 +629,7 @@ async def _run_one_openreward_task(
             finished=outcome.finished,
             tool_calls=outcome.tool_calls,
             turns=outcome.turns,
+            session_id=session_id,
             session_status="completed",
             error=outcome.error,
         )
@@ -637,14 +660,17 @@ async def _run_openreward_session_loop(
     auto_submit_attempted = False
     required_fields_by_tool = _required_tool_fields_by_name(tools)
     submission_tool_name = _infer_submission_tool_name(tools)
+    trace_event_seq = 0
 
     async def trace(event: str, payload: dict[str, Any]) -> None:
+        nonlocal trace_event_seq
+        trace_event_seq += 1
         await _trace_openreward_event(
             trace_path=trace_path,
             trace_lock=trace_lock,
             trace_context=trace_context,
             event=event,
-            payload=payload,
+            payload={"trace_event_seq": trace_event_seq, **payload},
         )
 
     try:
@@ -662,6 +688,10 @@ async def _run_openreward_session_loop(
                     "max_steps": max_steps,
                     "tool_count": len(tools),
                     "submission_tool": submission_tool_name,
+                    "task_payload": _openreward_task_payload(task),
+                    "prompt_blocks": json_ready(prompt_blocks),
+                    "prompt_text_chars": len(prompt_text),
+                    "tools": json_ready(tools),
                 },
             )
 
@@ -725,7 +755,14 @@ async def _run_openreward_session_loop(
                     "tool_choice": "auto",
                     "parallel_tool_calls": False,
                 }
-                await trace("llm_request", {"turn": turns, "request": request_payload})
+                await trace(
+                    "llm_request",
+                    {
+                        "turn": turns,
+                        "message_count": len(messages),
+                        "request": request_payload,
+                    },
+                )
                 chat_result = await llm_client.stream_chat(
                     model=model_name,
                     messages=messages,
@@ -737,14 +774,17 @@ async def _run_openreward_session_loop(
                 )
                 normalized_tool_calls = _normalize_tool_calls(chat_result.tool_calls)
                 assistant_content = str(chat_result.content or "")
+                assistant_reasoning = str(chat_result.reasoning or "")
                 await trace(
                     "llm_response",
                     {
                         "turn": turns,
                         "response": {
                             "content": assistant_content,
+                            "reasoning": assistant_reasoning,
                             "tool_calls": normalized_tool_calls,
                             "usage": chat_result.usage,
+                            "raw_events": chat_result.raw_events,
                         },
                     },
                 )
@@ -1204,12 +1244,14 @@ async def _trace_openreward_event(
     payload: dict[str, Any],
 ) -> None:
     """Append one OpenReward trace event and keep tracing non-fatal."""
-    event_payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event": str(event),
-        **trace_context,
-        **payload,
-    }
+    event_payload = _trace_json_ready(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": str(event),
+            **trace_context,
+            **payload,
+        }
+    )
     try:
         await _append_openreward_trace_row(
             trace_path=trace_path,
@@ -1219,6 +1261,79 @@ async def _trace_openreward_event(
     except Exception:
         # Tracing must never break production task execution.
         return
+
+
+def _openreward_trace_common_context(
+    *,
+    config: BatchRunConfig,
+    batch_id: str,
+    profile_name: str,
+    profile: ProviderProfileConfig,
+    model_name: str,
+    tool_format: str,
+) -> dict[str, Any]:
+    """Build stable trace context shared by all OpenReward task events in one batch."""
+    return {
+        "trace_schema_version": 2,
+        "dataset": _OPENREWARD_DATASET_NAME,
+        "batch_id": batch_id,
+        "project_dir": str(config.project_dir.resolve()),
+        "app_dir": str(config.app_dir.resolve()),
+        "provider_profile": str(profile_name),
+        "inference_provider": str(profile_name),
+        "inference_endpoint": str(profile.base_url),
+        "inference_model": str(model_name),
+        "inference_api_key_env": str(profile.api_key_env),
+        "inference_parameters": {
+            "temperature": float(profile.temperature),
+            "max_tokens": int(profile.max_tokens),
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        },
+        "openreward_environment": str(config.environment or ""),
+        "openreward_variant": _optional_str(config.variant),
+        "openreward_base_url": _optional_str(config.base_url),
+        "openreward_tool_format": str(tool_format),
+        "task_selector": {
+            "split": str(config.split),
+            "task_index": config.task_index,
+            "start": config.start,
+            "stop": config.stop,
+            "task_specs": [str(item) for item in config.task_specs],
+            "limit": config.limit,
+            "concurrency": int(config.concurrency),
+            "max_steps": int(config.max_steps),
+        },
+    }
+
+
+def _openreward_trace_session_id(*, batch_id: str, split: str, task_key: str) -> str:
+    """Build stable per-task trace session id for cross-file joins."""
+    batch = str(batch_id or "").strip() or "batch"
+    split_name = str(split or "").strip() or "split"
+    key = str(task_key or "").strip() or "task"
+    return f"{batch}:{split_name}:{key}"
+
+
+def _openreward_task_payload(task: Any) -> dict[str, Any]:
+    """Build trace-safe task payload snapshot for one OpenReward task."""
+    payload = json_ready(task)
+    if isinstance(payload, dict):
+        return payload
+    return {"value": payload}
+
+
+def _trace_json_ready(value: Any) -> Any:
+    """Recursively convert payload into trace-safe JSON-friendly values."""
+    if isinstance(value, dict):
+        return {str(key): _trace_json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_trace_json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [_trace_json_ready(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 async def _append_jsonl_object(*, results_path: Path, payload: dict[str, Any], append_lock: asyncio.Lock) -> None:
@@ -1288,6 +1403,7 @@ def _openreward_row_from_dict(payload: dict[str, Any]) -> OpenRewardBatchItemRes
         finished=bool(payload.get("finished", False)),
         tool_calls=int(payload.get("tool_calls", 0) or 0),
         turns=int(payload.get("turns", 0) or 0),
+        session_id=_optional_str(payload.get("session_id")),
         session_status=str(payload.get("session_status", "failed")),
         error=_optional_str(payload.get("error")),
     )

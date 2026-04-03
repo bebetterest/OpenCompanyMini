@@ -156,3 +156,62 @@ async def test_stream_chat_http_status_error_includes_response_body() -> None:
     message = str(exc_info.value)
     assert "response_body=" in message
     assert "invalid_function_parameters" in message
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_retries_on_empty_stream() -> None:
+    class EmptyThenSuccessAsyncClient:
+        last_request: dict[str, object] | None = None
+        call_count: int = 0
+
+        def __init__(self, *, timeout: float) -> None:
+            _ = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        def stream(self, method: str, url: str, *, headers: dict[str, str], json: dict[str, object]):
+            type(self).last_request = {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "json": json,
+            }
+            type(self).call_count += 1
+            if type(self).call_count == 1:
+                return FakeStreamResponse(chunks=[], status_code=200, error_body="")
+            return FakeStreamResponse(
+                chunks=[
+                    'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+                    "data: [DONE]\n\n",
+                ],
+                status_code=200,
+                error_body="",
+            )
+
+    client = OpenAICompatibleClient(
+        base_url="https://example.com/v1",
+        api_key="test-key",
+        timeout_seconds=30,
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._retry_delay = lambda attempt: 0.0  # type: ignore[method-assign]
+    retries: list[dict[str, object]] = []
+
+    with mock.patch("httpx.AsyncClient", EmptyThenSuccessAsyncClient):
+        result = await client.stream_chat(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "test"}],
+            temperature=0.1,
+            max_tokens=64,
+            on_retry=lambda payload: retries.append(payload),
+        )
+
+    assert result.content == "ok"
+    assert EmptyThenSuccessAsyncClient.call_count == 2
+    assert len(retries) == 1
+    assert retries[0]["reason"] == "empty_stream"

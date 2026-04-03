@@ -1,5 +1,26 @@
 # 进度
 
+## 2026-03-31
+
+- 为 `openreward_results.jsonl` 每行新增 `session_id`（稳定任务级 id，与 trace `trace_session_id` 对齐：`<batch_id>:<split>:<task_key>`），并保持旧结果行缺失该字段时的向后兼容读取。
+- 增强 OpenReward trace schema，提升可追溯性与审计能力：
+  - 每条 trace 新增 batch/provider/model 上下文（`trace_schema_version`、`batch_id`、`provider_profile`、`inference_*`、选择器元数据、工具格式）。
+  - 新增环境/任务谱系字段（`openreward_environment`、`variant`、`task_key/task_index/task_id`、每任务 `trace_session_id`）。
+  - 新增事件内顺序号（`trace_event_seq`）及更完整模型负载记录（`reasoning`、`raw_events`、请求消息数、任务快照、prompt blocks/tools 快照）。
+  - trace 写入前增加 JSON 安全转换，避免非基础类型片段导致写入失败。
+- 扩展 `export --mode sft` 导出结构，同时保持向后兼容：
+  - 保留旧 `target` 动作监督格式（`target.content = {"actions":[...]}`）。
+  - 新增 `messages_complete`、`assistant_response`（可含 reasoning/tool_calls/usage/raw_events）、`actions`、`environment`、`agent_snapshot`、`traceability`。
+  - 从 attempt 产物提取并导出推理元数据（`metadata.inference_provider/endpoint/model/api_key_env/inference_parameters`）。
+- 新增回归测试，覆盖 OpenReward trace 可追溯字段与增强后的 SFT 导出结构。
+- 同步更新 README/README_cn 镜像，补充 OpenReward trace 与 SFT 导出字段约定。
+- 在 agent-step 维度统一重试统计，并落盘到 `turns.jsonl`（`overall_retries`、`api_or_network_retries`、`empty_stream_retries`、`parse_retries`、`parse_empty_retries`、`context_overflow_retries`）。
+- 在 OpenAI 兼容客户端补充“空流重试”处理（流结束但没有任何 SSE 事件时，在 provider 重试预算内重试，并记录重试原因）。
+- 协议解析失败重试提示改为 `invalid_response`，并携带具体 `error` 与 `fix guidance`，帮助模型按错误信息自修正。
+- 新增独立的上下文超窗重试通道（`runtime.limits.max_context_overflow_retries`）：触发 `compress_context` 后重试，不占用协议解析重试预算。
+- 新增回归测试，覆盖空流重试、协议重试提示内容、重试统计落盘，以及 `max_context_overflow_retries` 配置加载。
+- 将所有 provider profile（`openrouter`、`tinker`、`custom`）的默认模型统一改为 `qwen/qwen3.6-plus-preview:free`，并同步更新 `opm_train.toml` 与 README 中英镜像。
+
 ## 2026-03-29
 
 - 提升 OpenRouter profile 的重试预算（`provider.openrouter.max_retries`），用于真实批跑时更好吸收 provider 侧瞬时限流（尤其是免费模型）。

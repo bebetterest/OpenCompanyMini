@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Callable
 
 from opm_train.context import compress_context, maybe_auto_compress
 from opm_train.loop import ActionBatchResult, AgentLoopRunner
@@ -32,6 +32,15 @@ from opm_train.tools import (
 from opm_train.utils import json_ready, utc_now
 
 _INVALID_MODEL_PAYLOAD_SUMMARY = "Model returned invalid action payload."
+_CONTEXT_OVERFLOW_ERROR_HINTS: tuple[str, ...] = (
+    "maximum context length",
+    "context length exceeded",
+    "context window",
+    "too many tokens",
+    "token limit exceeded",
+    "input is too long",
+    "request is too large",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +154,14 @@ class OrchestratorAgentLifecycleMixin:
             "event_seq_end": None,
             "attempts": [],
             "final_attempt": None,
+            "retry_metrics": {
+                "overall_retries": 0,
+                "api_or_network_retries": 0,
+                "empty_stream_retries": 0,
+                "parse_retries": 0,
+                "parse_empty_retries": 0,
+                "context_overflow_retries": 0,
+            },
             "actions": [],
             "action_results": [],
             "finish_payload": None,
@@ -271,6 +288,7 @@ class OrchestratorAgentLifecycleMixin:
                 "status": turn["status"],
                 "final_attempt": turn.get("final_attempt"),
                 "attempt_count": len([item for item in turn.get("attempts", []) if isinstance(item, dict)]),
+                "retry_metrics": json_ready(turn.get("retry_metrics", {})),
                 "step_error": turn["step_error"],
             },
         )
@@ -292,7 +310,22 @@ class OrchestratorAgentLifecycleMixin:
     async def _ask_agent(self, agent: AgentNode) -> list[dict[str, Any]]:
         """Assemble context, call model, and normalize response into actions."""
         with self._timer_scope("ask_agent", agent=agent):
-            self._ensure_active_turn(agent=agent)
+            turn = self._ensure_active_turn(agent=agent)
+            retry_metrics = turn.get("retry_metrics")
+            if not isinstance(retry_metrics, dict):
+                retry_metrics = {
+                    "overall_retries": 0,
+                    "api_or_network_retries": 0,
+                    "empty_stream_retries": 0,
+                    "parse_retries": 0,
+                    "parse_empty_retries": 0,
+                    "context_overflow_retries": 0,
+                }
+                turn["retry_metrics"] = retry_metrics
+
+            def bump_retry_metric(key: str, *, amount: int = 1) -> None:
+                retry_metrics[key] = max(0, int(retry_metrics.get(key, 0) or 0)) + max(0, int(amount))
+
             await self._maybe_record_auto_compression(agent)
             self._apply_pending_steers(agent)
 
@@ -303,12 +336,15 @@ class OrchestratorAgentLifecycleMixin:
                 system_prompt = self.context_assembler.system_prompt(agent)
                 tools = self.context_assembler.tools(agent)
             policy = self._protocol_retry_policy()
+            max_context_overflow_retries = max(0, int(self.config.runtime.limits.max_context_overflow_retries))
+            context_overflow_retries = 0
+            protocol_attempt = 1
 
-            for attempt in range(policy.max_attempts):
+            while protocol_attempt <= policy.max_attempts:
                 with self._timer_scope(
                     "prompt_assembly",
                     agent=agent,
-                    payload={"protocol_attempt": attempt + 1, "protocol_max_attempts": policy.max_attempts},
+                    payload={"protocol_attempt": protocol_attempt, "protocol_max_attempts": policy.max_attempts},
                 ):
                     request_messages = self.context_assembler.messages(agent, system_prompt=system_prompt)
                 self._log_event(
@@ -320,7 +356,7 @@ class OrchestratorAgentLifecycleMixin:
                         "inference_parameters": inference_metadata["inference_parameters"],
                         "message_count": len(request_messages),
                         "tool_count": len(tools),
-                        "protocol_attempt": attempt + 1,
+                        "protocol_attempt": protocol_attempt,
                         "protocol_max_attempts": policy.max_attempts,
                     },
                 )
@@ -328,7 +364,7 @@ class OrchestratorAgentLifecycleMixin:
                     agent=agent,
                     payload={
                         "timestamp": utc_now(),
-                        "protocol_attempt": attempt + 1,
+                        "protocol_attempt": protocol_attempt,
                         "protocol_max_attempts": policy.max_attempts,
                         **inference_metadata,
                         "tool_count": len(tools),
@@ -339,16 +375,25 @@ class OrchestratorAgentLifecycleMixin:
                 )
                 self._record_turn_attempt_request(
                     agent=agent,
-                    attempt=attempt + 1,
+                    attempt=protocol_attempt,
                     llm_sequence=llm_sequence,
                 )
-                on_token, on_reasoning, on_retry = self._llm_callbacks(agent)
+
+                def on_llm_retry(payload: dict[str, Any]) -> None:
+                    reason = str(payload.get("reason", "")).strip().lower()
+                    bump_retry_metric("overall_retries")
+                    if reason == "empty_stream":
+                        bump_retry_metric("empty_stream_retries")
+                        return
+                    bump_retry_metric("api_or_network_retries")
+
+                on_token, on_reasoning, on_retry = self._llm_callbacks(agent, on_retry_hook=on_llm_retry)
 
                 try:
                     with self._timer_scope(
                         "llm_call",
                         agent=agent,
-                        payload={"protocol_attempt": attempt + 1, "model": model},
+                        payload={"protocol_attempt": protocol_attempt, "model": model},
                     ):
                         result = await self.llm_client.stream_chat(
                             model=model,
@@ -376,17 +421,53 @@ class OrchestratorAgentLifecycleMixin:
                     )
                     self._record_turn_attempt_response(
                         agent=agent,
-                        attempt=attempt + 1,
+                        attempt=protocol_attempt,
                         llm_sequence=llm_sequence,
                         ok=False,
                         parse_error=str(exc),
                     )
+                    if (
+                        context_overflow_retries < max_context_overflow_retries
+                        and self._is_context_overflow_error(exc)
+                    ):
+                        context_overflow_retries += 1
+                        bump_retry_metric("context_overflow_retries")
+                        self._log_event(
+                            agent,
+                            "context_overflow_retry",
+                            {
+                                "protocol_attempt": protocol_attempt,
+                                "retry_index": context_overflow_retries,
+                                "max_retries": max_context_overflow_retries,
+                                "error": str(exc),
+                                "sequence": llm_sequence,
+                            },
+                        )
+                        compression_result = await compress_context(
+                            agent=agent,
+                            reason="context_overflow_retry",
+                            config=self.config,
+                            prompt_library=self.prompt_library,
+                            llm_client=self.llm_client,
+                        )
+                        self._record_context_compression(
+                            agent=agent,
+                            reason="context_overflow_retry",
+                            result=compression_result,
+                        )
+                        self._log_event(
+                            agent,
+                            "context_compressed",
+                            {"reason": "context_overflow_retry", **compression_result},
+                        )
+                        if bool(compression_result.get("compressed", False)):
+                            continue
                     self._record_exception(
                         stage="llm_call",
                         exc=exc,
                         agent=agent,
                         payload={
-                            "protocol_attempt": attempt + 1,
+                            "protocol_attempt": protocol_attempt,
                             "protocol_max_attempts": policy.max_attempts,
                             "sequence": llm_sequence,
                         },
@@ -404,7 +485,7 @@ class OrchestratorAgentLifecycleMixin:
                 response_payload = {
                     "timestamp": utc_now(),
                     "ok": True,
-                    "protocol_attempt": attempt + 1,
+                    "protocol_attempt": protocol_attempt,
                     "protocol_max_attempts": policy.max_attempts,
                     **inference_metadata,
                     "content": result.content,
@@ -417,7 +498,7 @@ class OrchestratorAgentLifecycleMixin:
                     with self._timer_scope(
                         "model_parse",
                         agent=agent,
-                        payload={"protocol_attempt": attempt + 1, "sequence": llm_sequence},
+                        payload={"protocol_attempt": protocol_attempt, "sequence": llm_sequence},
                     ):
                         if canonical_tool_calls:
                             actions = normalize_tool_calls(canonical_tool_calls)
@@ -428,12 +509,12 @@ class OrchestratorAgentLifecycleMixin:
                     self._record_llm_call_response(agent=agent, sequence=llm_sequence, payload=response_payload)
                     self._record_turn_attempt_response(
                         agent=agent,
-                        attempt=attempt + 1,
+                        attempt=protocol_attempt,
                         llm_sequence=llm_sequence,
                         ok=True,
                         parse_error=None,
                     )
-                    self._record_turn_final_attempt(agent=agent, attempt=attempt + 1)
+                    self._record_turn_final_attempt(agent=agent, attempt=protocol_attempt)
                     return actions
                 except ProtocolError as exc:
                     response_payload["ok"] = False
@@ -441,7 +522,7 @@ class OrchestratorAgentLifecycleMixin:
                     self._record_llm_call_response(agent=agent, sequence=llm_sequence, payload=response_payload)
                     self._record_turn_attempt_response(
                         agent=agent,
-                        attempt=attempt + 1,
+                        attempt=protocol_attempt,
                         llm_sequence=llm_sequence,
                         ok=False,
                         parse_error=str(exc),
@@ -452,20 +533,35 @@ class OrchestratorAgentLifecycleMixin:
                         {
                             "error": str(exc),
                             "content": result.content,
-                            "protocol_attempt": attempt + 1,
+                            "protocol_attempt": protocol_attempt,
                             "protocol_max_attempts": policy.max_attempts,
                         },
                     )
-                    if attempt >= policy.max_retries:
+                    if protocol_attempt > policy.max_retries:
                         return self._invalid_model_response_actions(agent)
+                    bump_retry_metric("overall_retries")
+                    bump_retry_metric("parse_retries")
+                    if self._is_parse_empty_error(str(exc)):
+                        bump_retry_metric("parse_empty_retries")
                     retry_message = self._protocol_retry_message(
                         error=str(exc),
-                        next_attempt=attempt + 2,
+                        next_attempt=protocol_attempt + 1,
                         max_attempts=policy.max_attempts,
                     )
                     agent.conversation.append({"role": "user", "content": retry_message})
+                    self._log_event(
+                        agent,
+                        "protocol_retry_scheduled",
+                        {
+                            "protocol_attempt": protocol_attempt,
+                            "next_attempt": protocol_attempt + 1,
+                            "max_attempts": policy.max_attempts,
+                            "error": str(exc),
+                        },
+                    )
                     if policy.backoff_seconds > 0:
-                        await asyncio.sleep(policy.backoff_seconds * (attempt + 1))
+                        await asyncio.sleep(policy.backoff_seconds * protocol_attempt)
+                    protocol_attempt += 1
                     continue
             return self._invalid_model_response_actions(agent)
 
@@ -500,7 +596,39 @@ class OrchestratorAgentLifecycleMixin:
             backoff_seconds=backoff_seconds,
         )
 
-    def _llm_callbacks(self, agent: AgentNode) -> tuple[Any, Any, Any]:
+    def _is_context_overflow_error(self, exc: Exception) -> bool:
+        """Return whether exception looks like provider context-window overflow."""
+        message = str(exc).strip().lower()
+        if not message:
+            return False
+        return any(hint in message for hint in _CONTEXT_OVERFLOW_ERROR_HINTS)
+
+    @staticmethod
+    def _is_parse_empty_error(error: str) -> bool:
+        """Return whether protocol error indicates empty/absent parsed payload."""
+        message = str(error).strip().lower()
+        if not message:
+            return False
+        return "no json object found" in message or "non-empty actions list" in message
+
+    @staticmethod
+    def _protocol_error_fix_hint(error: str) -> str:
+        """Render compact actionable hint for common protocol parse failures."""
+        normalized = str(error).strip().lower()
+        if "invalid json response" in normalized or "no json object found" in normalized:
+            return 'Return exactly one JSON object like {"actions":[...]} with no extra prose.'
+        if "non-empty actions list" in normalized or "each action must" in normalized:
+            return 'Ensure "actions" is a non-empty array and every action has a non-empty "type".'
+        if "tool arguments" in normalized:
+            return "Ensure each tool call function.arguments is valid JSON object text."
+        return "Use only valid tool names and strictly valid JSON arguments."
+
+    def _llm_callbacks(
+        self,
+        agent: AgentNode,
+        *,
+        on_retry_hook: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[Any, Any, Any]:
         """Build LLM stream callbacks bound to one agent."""
 
         async def on_token(token: str) -> None:
@@ -510,6 +638,8 @@ class OrchestratorAgentLifecycleMixin:
             self._log_event(agent, "llm_reasoning", {"token": token})
 
         async def on_retry(payload: dict[str, Any]) -> None:
+            if callable(on_retry_hook):
+                on_retry_hook(payload)
             self._log_event(agent, "llm_retry", payload)
 
         return on_token, on_reasoning, on_retry
@@ -541,17 +671,21 @@ class OrchestratorAgentLifecycleMixin:
 
     def _protocol_retry_message(self, *, error: str, next_attempt: int, max_attempts: int) -> str:
         """Render protocol retry prompt with safe fallback when key is absent."""
+        hint = self._protocol_error_fix_hint(error)
         try:
             return self.prompt_library.render_runtime_message(
-                "protocol_retry_message",
+                "invalid_response",
                 error=error,
+                hint=hint,
                 next_attempt=next_attempt,
                 max_attempts=max_attempts,
             )
         except KeyError:
             return (
-                "Previous response could not be parsed into valid actions JSON. "
-                f"Error: {error}. Please reply with valid actions JSON only "
+                "Your previous response was invalid. "
+                f"Error: {error}. "
+                f"Fix guidance: {hint}. "
+                "Please reply using only valid tool-calling JSON "
                 f"(retry {next_attempt}/{max_attempts})."
             )
 
@@ -576,7 +710,9 @@ class OrchestratorAgentLifecycleMixin:
                     "type": "finish",
                     "status": "failed",
                     "summary": _INVALID_MODEL_PAYLOAD_SUMMARY,
-                    "next_recommendation": "Retry with a valid JSON actions object.",
+                    "next_recommendation": (
+                        "First review this agent's progress, then plan and execute next actions."
+                    ),
                 }
             ]
         return [
@@ -619,6 +755,8 @@ class OrchestratorAgentLifecycleMixin:
                     await self.hooks.after_action(agent=agent, context=context, action=action, result=projected)
                     if isinstance(result.get("finish_payload"), dict):
                         finish_payload = dict(result["finish_payload"])
+                        break
+                    if bool(result.get("interrupted_by_steer", False)):
                         break
                 self._finalize_turn(
                     agent=agent,
@@ -668,6 +806,11 @@ class OrchestratorAgentLifecycleMixin:
             projected = {
                 "wait_run_status": bool(raw_result.get("wait_run_status", False)),
             }
+            if bool(raw_result.get("interrupted_by_steer", False)):
+                projected["interrupted_by_steer"] = True
+            end_reason = str(raw_result.get("end_reason", "")).strip()
+            if end_reason:
+                projected["end_reason"] = end_reason
             if bool(raw_result.get("timed_out", False)):
                 projected["timed_out"] = True
                 projected["timeout_seconds"] = raw_result.get("timeout_seconds")
@@ -678,6 +821,11 @@ class OrchestratorAgentLifecycleMixin:
             projected = {
                 "wait_time_status": bool(raw_result.get("wait_time_status", False)),
             }
+            if bool(raw_result.get("interrupted_by_steer", False)):
+                projected["interrupted_by_steer"] = True
+            end_reason = str(raw_result.get("end_reason", "")).strip()
+            if end_reason:
+                projected["end_reason"] = end_reason
             if bool(raw_result.get("timed_out", False)):
                 projected["timed_out"] = True
                 projected["timeout_seconds"] = raw_result.get("timeout_seconds")

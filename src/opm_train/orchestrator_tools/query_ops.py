@@ -42,6 +42,9 @@ _KNOWN_TOOL_STATUSES = frozenset(
 )
 
 _GET_AGENT_RUN_MAX_MESSAGES = 5
+_WAIT_RUN_EVENT_POLL_SECONDS = 0.5
+_WAIT_AGENT_POLL_SECONDS = 0.2
+_WAIT_TIME_POLL_SECONDS = 0.2
 
 
 class QueryToolMixin:
@@ -51,6 +54,22 @@ class QueryToolMixin:
     tool_runs: dict[str, ToolRun]
     tool_tasks: dict[str, asyncio.Task[Any]]
     tool_run_events: dict[str, asyncio.Event]
+    pending_steers: dict[str, list[str]]
+
+    def _wait_interrupted_by_steer(self, request_agent_id: str) -> bool:
+        """Return whether waiting agent has queued steer messages."""
+        if not request_agent_id:
+            return False
+        return bool(self.pending_steers.get(request_agent_id))
+
+    @staticmethod
+    def _wait_interrupted_result(field_name: str) -> dict[str, Any]:
+        """Build canonical wait result when interrupted by steering."""
+        return {
+            field_name: True,
+            "interrupted_by_steer": True,
+            "end_reason": "received_steer_message",
+        }
 
     @staticmethod
     def _id_kind(identifier: str) -> str:
@@ -249,28 +268,32 @@ class QueryToolMixin:
         include_result = _coerce_bool(action.get("include_result"), default=False)
         return {"tool_run": self._tool_run_overview(run, include_result=include_result)}
 
-    async def _tool_wait_run(self, action: dict[str, Any]) -> dict[str, Any]:
+    async def _tool_wait_run(self, wait_request_run: ToolRun, action: dict[str, Any]) -> dict[str, Any]:
         """Wait for tool or agent completion with timeout budget."""
         error = validate_wait_run_action(action)
         if error:
             return {"wait_run_status": False, "error": error}
 
         timeout_seconds = max(0.0, float(self.config.runtime.tools.wait_run_timeout_seconds))
-        started = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        request_agent_id = str(wait_request_run.agent_id).strip()
 
         tool_run_id = str(action.get("tool_run_id", "")).strip()
         agent_id = str(action.get("agent_id", "")).strip()
 
         while True:
+            if self._wait_interrupted_by_steer(request_agent_id):
+                return self._wait_interrupted_result("wait_run_status")
             if tool_run_id:
-                run = self.tool_runs.get(tool_run_id)
-                if run is None:
+                target_run = self.tool_runs.get(tool_run_id)
+                if target_run is None:
                     return {"wait_run_status": False, "error": f"Tool run {tool_run_id} was not found."}
-                if run.status.value in TERMINAL_TOOL_RUN_STATUSES:
+                if target_run.status.value in TERMINAL_TOOL_RUN_STATUSES:
                     return {"wait_run_status": True}
                 waiter = self.tool_run_events.setdefault(tool_run_id, asyncio.Event())
                 try:
-                    await asyncio.wait_for(waiter.wait(), timeout=0.5)
+                    await asyncio.wait_for(waiter.wait(), timeout=_WAIT_RUN_EVENT_POLL_SECONDS)
                 except asyncio.TimeoutError:
                     pass
                 finally:
@@ -288,9 +311,9 @@ class QueryToolMixin:
                     return {"wait_run_status": False, "error": f"Agent {agent_id} was not found."}
                 if agent.status.value in TERMINAL_AGENT_STATUSES:
                     return {"wait_run_status": True}
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(_WAIT_AGENT_POLL_SECONDS)
 
-            if timeout_seconds > 0 and (asyncio.get_running_loop().time() - started) >= timeout_seconds:
+            if timeout_seconds > 0 and (loop.time() - started) >= timeout_seconds:
                 return {
                     "wait_run_status": False,
                     "timed_out": True,
@@ -336,25 +359,39 @@ class QueryToolMixin:
             "cancelled_agents_count": cancelled_agents_count,
         }
 
-    async def _tool_wait_time(self, action: dict[str, Any]) -> dict[str, Any]:
+    async def _tool_wait_time(self, wait_request_run: ToolRun, action: dict[str, Any]) -> dict[str, Any]:
         """Sleep for validated seconds and return boolean completion."""
         error = validate_wait_time_action(action, config=self.config)
         if error:
             return {"wait_time_status": False, "error": error}
         seconds = float(action.get("seconds") or 0.0)
         timeout_seconds = max(0.0, float(self.config.runtime.tools.wait_run_timeout_seconds))
-        try:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        wait_deadline = started + seconds
+        request_agent_id = str(wait_request_run.agent_id).strip()
+
+        while True:
+            if self._wait_interrupted_by_steer(request_agent_id):
+                return self._wait_interrupted_result("wait_time_status")
+            now = loop.time()
+            if now >= wait_deadline:
+                return {"wait_time_status": True}
+            if timeout_seconds > 0 and (now - started) >= timeout_seconds:
+                return {
+                    "wait_time_status": False,
+                    "timed_out": True,
+                    "timeout_seconds": timeout_seconds,
+                }
+            remaining_wait = max(0.0, wait_deadline - now)
+            sleep_for = min(_WAIT_TIME_POLL_SECONDS, remaining_wait)
             if timeout_seconds > 0:
-                await asyncio.wait_for(asyncio.sleep(seconds), timeout=timeout_seconds)
-            else:
-                await asyncio.sleep(seconds)
-        except asyncio.TimeoutError:
-            return {
-                "wait_time_status": False,
-                "timed_out": True,
-                "timeout_seconds": timeout_seconds,
-            }
-        return {"wait_time_status": True}
+                remaining_timeout = max(0.0, timeout_seconds - (now - started))
+                sleep_for = min(sleep_for, remaining_timeout)
+            if sleep_for <= 0:
+                await asyncio.sleep(0)
+                continue
+            await asyncio.sleep(sleep_for)
 
     async def _tool_list_mcp_servers(self, action: dict[str, Any]) -> dict[str, Any]:
         """Soft-disabled MCP helper endpoint for parity with OpenCompany."""

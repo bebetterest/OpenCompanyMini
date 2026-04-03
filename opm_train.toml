@@ -8,7 +8,7 @@ profile = "openrouter"
 [provider.openrouter]
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
-model = "openai/gpt-4o-mini"
+model = "qwen/qwen3.6-plus-preview:free"
 timeout_seconds = 120
 max_retries = 8
 retry_backoff_seconds = 1.0
@@ -19,7 +19,7 @@ headers = { "HTTP-Referer" = "https://github.com/opencompany/opm-train", "X-Titl
 [provider.tinker]
 base_url = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 api_key_env = "TINKER_API_KEY"
-model = "tinker://replace-with-sampler-checkpoint"
+model = "qwen/qwen3.6-plus-preview:free"
 timeout_seconds = 120
 max_retries = 2
 retry_backoff_seconds = 1.0
@@ -29,7 +29,7 @@ max_tokens = 4096
 [provider.custom]
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o-mini"
+model = "qwen/qwen3.6-plus-preview:free"
 timeout_seconds = 120
 max_retries = 2
 retry_backoff_seconds = 1.0
@@ -43,6 +43,7 @@ max_root_steps = 64
 max_agent_steps = 48
 max_protocol_retries = 2
 protocol_retry_backoff_seconds = 0.25
+max_context_overflow_retries = 1
 
 [runtime.context]
 enabled = true

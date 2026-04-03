@@ -138,7 +138,14 @@ opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] 
 约束：
 
 - `--step` 必须搭配 `--agent-id`。
-- `--mode sft` 输出 OpenAI-messages 风格样本，只使用每轮最终成功协议尝试。
+- `--mode sft` 每个 turn 输出一条样本，使用该 turn 最终成功的协议尝试。
+  - 保留向后兼容的 `target`（动作监督负载：`{"actions":[...]}`）。
+  - 同时导出更完整的训练/追溯字段：
+    - `messages_complete`：请求 `messages` + 完整 assistant 响应。
+    - `assistant_response`：包含 `content`，以及可用时的 `reasoning`、`tool_calls`、`usage`、`raw_events`。
+    - `metadata.inference_*`：provider/model/endpoint/参数等推理元数据。
+    - `environment`：会话任务/项目/provider profile 与完整 `config_snapshot`。
+    - `traceability`：`llm_sequence`、request/response 产物路径、event-seq 范围、turn 时间戳。
 - 仅支持快照版本 `schema_version >= 4` 的会话导出（旧会话会被拒绝）。
 
 ## SFT 工作流
@@ -270,10 +277,16 @@ PY
   - 可设置长度上限 `tool_output_truncate_max_chars`（仅在开启截断时生效）
   - `openreward_trace.jsonl` 会记录 `content_chars` 与 `content_truncated`
     （当运行时执行截断，或上游工具输出已带截断标记时，`content_truncated=true`）
+  - trace 行还会记录端到端可追溯字段，包括：
+    - batch/provider/model 元数据（`batch_id`、`provider_profile`、`inference_*`、工具格式、任务选择器）
+    - 环境与任务谱系（`openreward_environment`、`variant`、`task_key/task_index/task_id`、每任务 `trace_session_id`）
+    - 逐轮请求/返回细节（`llm_request`、`llm_response`、`reasoning`、`raw_events`、`trace_event_seq`）
 - 结果输出采用 OpenReward 专用奖励语义，产物文件：
   - `openreward_results.jsonl`
   - `openreward_summary.json`
   - `openreward_trace.jsonl`
+- `openreward_results.jsonl` 每行包含稳定的任务级 `session_id`（与 trace 中 `trace_session_id` 同格式：`<batch_id>:<split>:<task_key>`），以及
+  `environment/split/variant/task_key/task_index/reward_total/finished/tool_calls/turns/session_status/error`。
 
 OfficeQA 单任务示例：
 
@@ -362,9 +375,10 @@ class MyDatasetAdapter(DatasetAdapter):
 - Provider 选择（`openrouter`、`tinker`、`custom`）统一走 OpenAI 兼容客户端。
 - `provider.tinker.base_url` 默认已设为 Tinker OpenAI 兼容推理端点：
   `https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1`。
-- `provider.tinker.model` 需使用 Tinker sampler 路径（`tinker://.../sampler_weights/...`），或在 `run/resume/batch-run` 用 `--model` 覆盖。
+- 所有 provider profile 的默认模型统一为 `qwen/qwen3.6-plus-preview:free`；如有需要，可在 profile 中或通过 `run/resume/batch-run` 的 `--model` 覆盖。
 - 运行限制（子代理数量、并发代理数、步数预算）。
-- 模型协议解析失败重试控制（`max_protocol_retries`、`protocol_retry_backoff_seconds`）。
+- 模型协议解析失败重试控制（`max_protocol_retries`、`protocol_retry_backoff_seconds`），以及独立的上下文超窗重试预算（`max_context_overflow_retries`）。
+- 每个 step 的重试统计会落盘到 `turns.jsonl`（`overall_retries`、API/网络重试、空流重试、解析重试、解析为空重试、上下文超窗重试）。
 - 工具集合与上下文压缩阈值。
 - `[runtime.context]` 提供全局工具回填截断控制：
   - `tool_output_truncate_enabled`（默认 `false`）

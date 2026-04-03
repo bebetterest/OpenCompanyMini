@@ -1,5 +1,26 @@
 # Progress
 
+## 2026-03-31
+
+- Added `session_id` to each `openreward_results.jsonl` row (stable per-task id aligned with trace `trace_session_id`: `<batch_id>:<split>:<task_key>`), and kept result-row loading backward-compatible when older rows miss this field.
+- Enriched OpenReward trace schema for stronger auditability:
+  - Added batch/provider/model context on each trace row (`trace_schema_version`, `batch_id`, `provider_profile`, `inference_*`, selector metadata, tool format).
+  - Added environment/task lineage fields (`openreward_environment`, `variant`, `task_key/task_index/task_id`, per-task `trace_session_id`).
+  - Added per-event ordering (`trace_event_seq`) and richer model payload capture (`reasoning`, `raw_events`, request message count, task payload snapshot, prompt blocks/tools snapshot).
+  - Hardened trace serialization with JSON-safe conversion so non-primitive payload fragments do not break trace writes.
+- Expanded `export --mode sft` payload while preserving backward compatibility:
+  - Kept existing action target (`target.content = {"actions":[...]}`) unchanged for old pipelines.
+  - Added `messages_complete`, `assistant_response` (with reasoning/tool_calls/usage/raw_events when present), `actions`, `environment`, `agent_snapshot`, and `traceability`.
+  - Added inference metadata export (`metadata.inference_provider/endpoint/model/api_key_env/inference_parameters`) sourced from attempt artifacts.
+- Added regression coverage for OpenReward traceability fields and enriched trajectory SFT export payloads.
+- Updated README/README_cn mirrors with the new OpenReward trace and SFT export field contracts.
+- Unified retry accounting at agent-step level and persisted counters into `turns.jsonl` (`overall_retries`, `api_or_network_retries`, `empty_stream_retries`, `parse_retries`, `parse_empty_retries`, `context_overflow_retries`).
+- Added empty-stream retry handling in the OpenAI-compatible client (stream closes with no SSE events now retries inside provider retry budget and reports retry reason).
+- Changed protocol parse retry feedback to use `invalid_response` with concrete `error` + `fix guidance` to help model self-correction.
+- Added independent context-overflow retry lane (`runtime.limits.max_context_overflow_retries`) that calls `compress_context` and retries without consuming protocol parse retry budget.
+- Added regression tests for empty-stream retry, invalid-response prompt content on protocol retry, retry-metrics persistence, and config loading for `max_context_overflow_retries`.
+- Changed default model in all provider profiles (`openrouter`, `tinker`, `custom`) to `qwen/qwen3.6-plus-preview:free`, and synced `opm_train.toml` + README mirrors accordingly.
+
 ## 2026-03-29
 
 - Increased OpenRouter profile retry budget for real batch runs (`provider.openrouter.max_retries`) to better absorb transient provider-side rate limits (especially free-tier models).

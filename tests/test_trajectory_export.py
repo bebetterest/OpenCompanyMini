@@ -156,9 +156,20 @@ async def test_export_trajectory_raw_and_sft_scope_filters() -> None:
         )
         assert isinstance(sft_rows, list)
         assert len(sft_rows) == 1
-        target = sft_rows[0]["target"]
+        row = sft_rows[0]
+        target = row["target"]
         payload = json.loads(target["content"])
         assert payload["actions"][0]["type"] == "finish"
+        assert isinstance(row["assistant_response"], dict)
+        assert row["assistant_response"]["role"] == "assistant"
+        assert isinstance(row["messages_complete"], list)
+        assert len(row["messages_complete"]) == len(row["messages"]) + 1
+        assert isinstance(row["environment"], dict)
+        assert row["environment"]["provider_profile"] == "openrouter"
+        assert isinstance(row["traceability"], dict)
+        assert row["traceability"]["request_file"]
+        assert row["traceability"]["response_file"]
+        assert row["metadata"]["inference_model"]
 
 
 @pytest.mark.asyncio

@@ -103,7 +103,7 @@ class ProviderConfig:
         default_factory=lambda: _provider_profile(
             base_url="https://openrouter.ai/api/v1",
             api_key_env="OPENROUTER_API_KEY",
-            model="openai/gpt-4o-mini",
+            model="qwen/qwen3.6-plus-preview:free",
             max_retries=8,
             headers={
                 "HTTP-Referer": "https://github.com/opencompany/opm-train",
@@ -115,14 +115,14 @@ class ProviderConfig:
         default_factory=lambda: _provider_profile(
             base_url="https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
             api_key_env="TINKER_API_KEY",
-            model="tinker://replace-with-sampler-checkpoint",
+            model="qwen/qwen3.6-plus-preview:free",
         )
     )
     custom: ProviderProfileConfig = field(
         default_factory=lambda: _provider_profile(
             base_url="",
             api_key_env="OPENAI_API_KEY",
-            model="gpt-4o-mini",
+            model="qwen/qwen3.6-plus-preview:free",
         )
     )
 
@@ -147,6 +147,7 @@ class RuntimeLimitsConfig:
     max_agent_steps: int = 48
     max_protocol_retries: int = 2
     protocol_retry_backoff_seconds: float = 0.25
+    max_context_overflow_retries: int = 1
 
 
 @dataclass(slots=True)
@@ -295,6 +296,11 @@ class OPMTrainConfig:
                 payload.get("protocol_retry_backoff_seconds"),
                 current.protocol_retry_backoff_seconds,
                 minimum=0.0,
+            ),
+            max_context_overflow_retries=_as_int(
+                payload.get("max_context_overflow_retries"),
+                current.max_context_overflow_retries,
+                minimum=0,
             ),
         )
 
