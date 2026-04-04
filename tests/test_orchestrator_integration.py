@@ -739,7 +739,7 @@ class RetryInvalidJsonThenSuccessLLM:
                         {
                             "type": "finish",
                             "status": "completed",
-                            "summary": "recovered after retry",
+                            "summary": "recovered on next step",
                         }
                     ]
                 }
@@ -776,7 +776,52 @@ class RetryInvalidToolCallThenSuccessLLM:
                         {
                             "type": "finish",
                             "status": "completed",
-                            "summary": "tool-call parse recovered",
+                            "summary": "tool-call parse recovered on next step",
+                        }
+                    ]
+                }
+            ),
+            raw_events=[],
+        )
+
+
+class RetryInvalidToolCallWithExecutableCandidateThenSuccessLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResult(
+                content="",
+                raw_events=[],
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "wait_time",
+                            "arguments": "{",
+                        },
+                    },
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {
+                            "name": "list_agent_runs",
+                            "arguments": "{\"limit\":1}",
+                        },
+                    },
+                ],
+            )
+        return ChatResult(
+            content=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "completed",
+                            "summary": "tool-call parse recovered by protocol retry",
                         }
                     ]
                 }
@@ -880,27 +925,45 @@ class RetryInvalidJsonCapturePromptLLM:
         )
 
 
-def test_invalid_model_response_actions_worker_recommends_review_before_planning() -> None:
+def test_protocol_retry_exhausted_message_requires_next_step_decision() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
-        worker = AgentNode(
-            id="agent-worker",
-            session_id="session-test",
-            name="Worker",
-            role=AgentRole.WORKER,
-            instruction="Do work",
-            workspace_path=project,
+        message = orchestrator._protocol_retry_exhausted_message(
+            error="No JSON object found in model response",
+            max_attempts=2,
         )
+        assert "No JSON object found in model response" in message
+        assert "Fix guidance:" in message
+        assert "No tool was executed in this step." in message
+        assert "do not call finish automatically" in message.lower()
 
-        assert orchestrator._invalid_model_response_actions(worker) == [
-            {
-                "type": "finish",
-                "status": "failed",
-                "summary": "Model returned invalid action payload.",
-                "next_recommendation": "First review this agent's progress, then plan and execute next actions.",
-            }
-        ]
+
+class RetryExhaustedThenFinishLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.exhausted_prompt = ""
+
+    async def stream_chat(self, **kwargs: Any) -> ChatResult:
+        self.calls += 1
+        messages = kwargs["messages"]
+        if self.calls == 1:
+            return ChatResult(content="still invalid payload", raw_events=[])
+        self.exhausted_prompt = str(messages[-1].get("content", "")) if messages else ""
+        return ChatResult(
+            content=json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "finish",
+                            "status": "completed",
+                            "summary": "finished after deciding next step",
+                        }
+                    ]
+                }
+            ),
+            raw_events=[],
+        )
 
 
 class ManualCompressAndChineseLLM:
@@ -1595,29 +1658,48 @@ async def test_blocking_spawn_status_reflects_failed_child() -> None:
 
 
 @pytest.mark.asyncio
-async def test_protocol_retry_recovers_from_invalid_json_payload() -> None:
+async def test_no_protocol_retry_when_step_has_no_executable_tool_call_from_invalid_json() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         llm = RetryInvalidJsonThenSuccessLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
-        orchestrator.config.runtime.limits.max_protocol_retries = 1
+        orchestrator.config.runtime.limits.max_protocol_retries = 3
         session = await orchestrator.run_task("retry invalid json")
         assert session.status.value == "completed"
-        assert session.final_summary == "recovered after retry"
+        assert session.final_summary == "recovered on next step"
         assert llm.calls == 2
+        turns = orchestrator.storage.load_turns(session.id)
+        assert len(turns) == 2
+        first_turn = turns[0]
+        assert int(first_turn.get("final_attempt", 0) or 0) == 1
+        assert first_turn["actions"] == []
+        assert first_turn["finish_payload"] is None
+        events = orchestrator.storage.load_events(session.id)
+        event_types = {str(item.get("event_type", "")) for item in events}
+        assert "protocol_retry_scheduled" not in event_types
+        assert "protocol_retry_skipped_no_executable_tool_call" in event_types
 
 
 @pytest.mark.asyncio
-async def test_protocol_retry_recovers_from_invalid_tool_call_arguments() -> None:
+async def test_no_protocol_retry_when_step_has_no_executable_tool_call_from_invalid_tool_args() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         llm = RetryInvalidToolCallThenSuccessLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
-        orchestrator.config.runtime.limits.max_protocol_retries = 1
+        orchestrator.config.runtime.limits.max_protocol_retries = 3
         session = await orchestrator.run_task("retry invalid tool call")
         assert session.status.value == "completed"
-        assert session.final_summary == "tool-call parse recovered"
+        assert session.final_summary == "tool-call parse recovered on next step"
         assert llm.calls == 2
+        turns = orchestrator.storage.load_turns(session.id)
+        assert len(turns) == 2
+        first_turn = turns[0]
+        assert int(first_turn.get("final_attempt", 0) or 0) == 1
+        assert first_turn["actions"] == []
+        assert first_turn["finish_payload"] is None
+        event_types = {str(item.get("event_type", "")) for item in orchestrator.storage.load_events(session.id)}
+        assert "protocol_retry_scheduled" not in event_types
+        assert "protocol_retry_skipped_no_executable_tool_call" in event_types
 
 
 @pytest.mark.asyncio
@@ -1634,20 +1716,41 @@ async def test_replayed_assistant_tool_call_uses_openai_compatible_shape() -> No
 
 
 @pytest.mark.asyncio
-async def test_protocol_retry_exhaustion_falls_back_to_invalid_payload_finish() -> None:
+async def test_protocol_retry_exhaustion_does_not_auto_finish() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         llm = RetryAlwaysInvalidLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
         orchestrator.config.runtime.limits.max_protocol_retries = 2
+        orchestrator.config.runtime.limits.max_root_steps = 1
         session = await orchestrator.run_task("retry exhausted")
         assert session.status.value == "completed"
-        assert session.final_summary == "Model returned invalid action payload."
-        assert llm.calls == 3
+        assert session.final_summary == "Root hit max step budget and produced forced partial finish."
+        assert llm.calls == 1
+        turns = orchestrator.storage.load_turns(session.id)
+        assert len(turns) == 1
+        assert turns[0]["actions"] == []
+        assert turns[0]["finish_payload"] is None
 
 
 @pytest.mark.asyncio
-async def test_protocol_retry_message_uses_invalid_response_with_error_details() -> None:
+async def test_protocol_retry_exhaustion_feedback_allows_next_step_decision() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        llm = RetryExhaustedThenFinishLLM()
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
+        orchestrator.config.runtime.limits.max_protocol_retries = 0
+        session = await orchestrator.run_task("retry exhausted next-step decision")
+        assert session.status.value == "completed"
+        assert session.final_summary == "finished after deciding next step"
+        assert llm.calls == 2
+        assert "did not include an executable tool call" in llm.exhausted_prompt
+        event_types = {str(item.get("event_type", "")) for item in orchestrator.storage.load_events(session.id)}
+        assert "protocol_retry_skipped_no_executable_tool_call" in event_types
+
+
+@pytest.mark.asyncio
+async def test_no_executable_tool_call_message_uses_invalid_response_with_error_details() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
         llm = RetryInvalidJsonCapturePromptLLM()
@@ -1659,14 +1762,14 @@ async def test_protocol_retry_message_uses_invalid_response_with_error_details()
         assert llm.calls == 2
         assert "Error: No JSON object found in model response" in llm.retry_prompt
         assert "Fix guidance:" in llm.retry_prompt
-        assert "Retry 2/2." in llm.retry_prompt
+        assert "No protocol retry will be attempted for this step." in llm.retry_prompt
 
 
 @pytest.mark.asyncio
 async def test_turn_index_records_step_attempts_and_llm_events() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
-        llm = RetryInvalidToolCallThenSuccessLLM()
+        llm = RetryInvalidToolCallWithExecutableCandidateThenSuccessLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
         orchestrator.config.runtime.limits.max_protocol_retries = 1
         session = await orchestrator.run_task("turn index retry")
@@ -1701,7 +1804,7 @@ async def test_turn_index_records_step_attempts_and_llm_events() -> None:
 async def test_turn_retry_metrics_records_protocol_retry_counters() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)
-        llm = RetryInvalidJsonThenSuccessLLM()
+        llm = RetryInvalidToolCallWithExecutableCandidateThenSuccessLLM()
         orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=llm)
         orchestrator.config.runtime.limits.max_protocol_retries = 1
         session = await orchestrator.run_task("turn retry metrics")
@@ -1713,7 +1816,7 @@ async def test_turn_retry_metrics_records_protocol_retry_counters() -> None:
         assert isinstance(metrics, dict)
         assert int(metrics.get("overall_retries", 0) or 0) == 1
         assert int(metrics.get("parse_retries", 0) or 0) == 1
-        assert int(metrics.get("parse_empty_retries", 0) or 0) == 1
+        assert int(metrics.get("parse_empty_retries", 0) or 0) == 0
         assert int(metrics.get("context_overflow_retries", 0) or 0) == 0
 
 

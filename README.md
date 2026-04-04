@@ -378,6 +378,8 @@ Edit `opm_train.toml`:
 - Default model for all provider profiles is `qwen/qwen3.6-plus-preview:free`; override per profile or via `--model` in `run/resume/batch-run` when needed.
 - Runtime limits (`max_children_per_agent`, `max_active_agents`, step budgets).
 - Protocol retry controls for invalid model payloads (`max_protocol_retries`, `protocol_retry_backoff_seconds`) plus independent context-overflow retry budget (`max_context_overflow_retries`).
+- When a step has no executable tool call, runtime skips protocol retry for that step, appends feedback, and moves to the next step for autonomous decision.
+- When protocol retries are exhausted for a step, runtime appends retry-exhausted feedback to the conversation and continues to the next step without auto-injecting `finish`.
 - Per-turn retry metrics are persisted in `turns.jsonl` (`overall_retries`, API/network retries, empty-stream retries, parse retries, parse-empty retries, context-overflow retries).
 - Runtime tools and context compression thresholds.
 - Global tool-output replay controls under `[runtime.context]`:

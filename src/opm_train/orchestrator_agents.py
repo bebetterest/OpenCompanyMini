@@ -31,7 +31,6 @@ from opm_train.tools import (
 )
 from opm_train.utils import json_ready, utc_now
 
-_INVALID_MODEL_PAYLOAD_SUMMARY = "Model returned invalid action payload."
 _CONTEXT_OVERFLOW_ERROR_HINTS: tuple[str, ...] = (
     "maximum context length",
     "context length exceeded",
@@ -537,8 +536,21 @@ class OrchestratorAgentLifecycleMixin:
                             "protocol_max_attempts": policy.max_attempts,
                         },
                     )
+                    if not self._has_executable_tool_call(canonical_tool_calls):
+                        self._record_turn_final_attempt(agent=agent, attempt=protocol_attempt)
+                        self._append_no_executable_tool_call_feedback(
+                            agent=agent,
+                            error=str(exc),
+                        )
+                        return []
                     if protocol_attempt > policy.max_retries:
-                        return self._invalid_model_response_actions(agent)
+                        self._record_turn_final_attempt(agent=agent, attempt=protocol_attempt)
+                        self._append_protocol_retry_exhausted_feedback(
+                            agent=agent,
+                            error=str(exc),
+                            max_attempts=policy.max_attempts,
+                        )
+                        return []
                     bump_retry_metric("overall_retries")
                     bump_retry_metric("parse_retries")
                     if self._is_parse_empty_error(str(exc)):
@@ -563,7 +575,12 @@ class OrchestratorAgentLifecycleMixin:
                         await asyncio.sleep(policy.backoff_seconds * protocol_attempt)
                     protocol_attempt += 1
                     continue
-            return self._invalid_model_response_actions(agent)
+            self._append_protocol_retry_exhausted_feedback(
+                agent=agent,
+                error="Protocol retry loop exited without a parsable action payload.",
+                max_attempts=policy.max_attempts,
+            )
+            return []
 
     def _inference_metadata(self, *, profile: Any, model: str) -> dict[str, Any]:
         """Build canonical inference metadata persisted in LLM request/response artifacts."""
@@ -689,6 +706,106 @@ class OrchestratorAgentLifecycleMixin:
                 f"(retry {next_attempt}/{max_attempts})."
             )
 
+    def _no_executable_tool_call_message(self, *, error: str) -> str:
+        """Render no-executable-tool-call prompt with safe fallback when key is absent."""
+        hint = self._protocol_error_fix_hint(error)
+        try:
+            return self.prompt_library.render_runtime_message(
+                "invalid_response_no_executable_tool_call",
+                error=error,
+                hint=hint,
+            )
+        except KeyError:
+            return (
+                "Your previous response did not include an executable tool call for this step. "
+                f"Error: {error}. "
+                f"Fix guidance: {hint}. "
+                "No protocol retry will be attempted for this step. "
+                "Continue to the next step and decide the next action yourself."
+            )
+
+    def _protocol_retry_exhausted_message(self, *, error: str, max_attempts: int) -> str:
+        """Render retry-exhausted prompt with safe fallback when key is absent."""
+        hint = self._protocol_error_fix_hint(error)
+        try:
+            return self.prompt_library.render_runtime_message(
+                "invalid_response_retry_exhausted",
+                error=error,
+                hint=hint,
+                max_attempts=max_attempts,
+            )
+        except KeyError:
+            return (
+                "Your previous responses were invalid for this step "
+                f"after {max_attempts} attempts. "
+                f"Last error: {error}. "
+                f"Fix guidance: {hint}. "
+                "No tool was executed for this step. "
+                "Continue to your next step and decide the next action yourself. "
+                "Do not call finish automatically."
+            )
+
+    def _append_no_executable_tool_call_feedback(
+        self,
+        *,
+        agent: AgentNode,
+        error: str,
+    ) -> None:
+        """Append no-executable-tool-call feedback into conversation for next decision step."""
+        feedback = self._no_executable_tool_call_message(error=error)
+        agent.conversation.append({"role": "user", "content": feedback})
+        self._log_event(
+            agent,
+            "protocol_retry_skipped_no_executable_tool_call",
+            {
+                "error": error,
+            },
+        )
+
+    def _append_protocol_retry_exhausted_feedback(
+        self,
+        *,
+        agent: AgentNode,
+        error: str,
+        max_attempts: int,
+    ) -> None:
+        """Append retry-exhausted feedback into conversation for the next decision step."""
+        feedback = self._protocol_retry_exhausted_message(error=error, max_attempts=max_attempts)
+        agent.conversation.append({"role": "user", "content": feedback})
+        self._log_event(
+            agent,
+            "protocol_retry_exhausted",
+            {
+                "error": error,
+                "max_attempts": int(max_attempts),
+            },
+        )
+
+    @staticmethod
+    def _has_executable_tool_call(tool_calls: list[dict[str, Any]]) -> bool:
+        """Return whether response contains at least one executable OpenAI tool call."""
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            function_payload = call.get("function")
+            if not isinstance(function_payload, dict):
+                continue
+            name = str(function_payload.get("name", "")).strip()
+            if not name:
+                continue
+            raw_arguments: Any = function_payload.get("arguments")
+            if isinstance(raw_arguments, (dict, list)):
+                encoded_arguments = json.dumps(raw_arguments, ensure_ascii=False)
+            else:
+                encoded_arguments = str(raw_arguments if raw_arguments is not None else "{}").strip() or "{}"
+            try:
+                parsed = json.loads(encoded_arguments)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return True
+        return False
+
     def _apply_pending_steers(self, agent: AgentNode) -> None:
         """Inject queued steering messages into agent conversation."""
         for pending in self.pending_steers.pop(agent.id, []):
@@ -701,27 +818,6 @@ class OrchestratorAgentLifecycleMixin:
                     ),
                 }
             )
-
-    def _invalid_model_response_actions(self, agent: AgentNode) -> list[dict[str, Any]]:
-        """Return deterministic fallback finish action for invalid model payload."""
-        if agent.role == AgentRole.WORKER:
-            return [
-                {
-                    "type": "finish",
-                    "status": "failed",
-                    "summary": _INVALID_MODEL_PAYLOAD_SUMMARY,
-                    "next_recommendation": (
-                        "First review this agent's progress, then plan and execute next actions."
-                    ),
-                }
-            ]
-        return [
-            {
-                "type": "finish",
-                "status": "partial",
-                "summary": _INVALID_MODEL_PAYLOAD_SUMMARY,
-            }
-        ]
 
     async def _execute_actions(
         self,

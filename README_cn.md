@@ -378,6 +378,8 @@ class MyDatasetAdapter(DatasetAdapter):
 - 所有 provider profile 的默认模型统一为 `qwen/qwen3.6-plus-preview:free`；如有需要，可在 profile 中或通过 `run/resume/batch-run` 的 `--model` 覆盖。
 - 运行限制（子代理数量、并发代理数、步数预算）。
 - 模型协议解析失败重试控制（`max_protocol_retries`、`protocol_retry_backoff_seconds`），以及独立的上下文超窗重试预算（`max_context_overflow_retries`）。
+- 当某个 step 没有可执行工具调用时，运行时会跳过该 step 的协议重试，回填反馈后进入下一步继续自主决策。
+- 当某个 step 的协议重试耗尽时，运行时会将“重试耗尽反馈”写回对话，并进入下一步继续决策，不会自动注入 `finish`。
 - 每个 step 的重试统计会落盘到 `turns.jsonl`（`overall_retries`、API/网络重试、空流重试、解析重试、解析为空重试、上下文超窗重试）。
 - 工具集合与上下文压缩阈值。
 - `[runtime.context]` 提供全局工具回填截断控制：

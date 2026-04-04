@@ -127,11 +127,13 @@ async def test_export_trajectory_raw_and_sft_scope_filters() -> None:
         )
         assert isinstance(raw, dict)
         assert raw["session_id"] == session.id
-        assert len(raw["turns"]) == 1
+        assert len(raw["turns"]) == 2
         attempts = raw["turns"][0]["attempts"]
-        assert len(attempts) == 2
+        assert len(attempts) == 1
         assert isinstance(attempts[0]["request"], dict)
         assert isinstance(attempts[0]["response"], dict)
+        assert raw["turns"][0]["actions"] == []
+        assert raw["turns"][1]["actions"][0]["type"] == "finish"
 
         scoped = export_trajectory(
             storage=orchestrator.storage,
