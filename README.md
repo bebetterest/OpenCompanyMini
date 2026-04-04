@@ -381,6 +381,7 @@ Edit `opm_train.toml`:
 - When a step has no executable tool call, runtime skips protocol retry for that step, appends feedback, and moves to the next step for autonomous decision.
 - When protocol retries are exhausted for a step, runtime appends retry-exhausted feedback to the conversation and continues to the next step without auto-injecting `finish`.
 - Per-turn retry metrics are persisted in `turns.jsonl` (`overall_retries`, API/network retries, empty-stream retries, parse retries, parse-empty retries, context-overflow retries).
+- Provider stream retry now also covers mid-stream disconnects after partial SSE output; each retry attempt discards failed-attempt partial output and keeps only the successful attempt output.
 - Runtime tools and context compression thresholds.
 - Global tool-output replay controls under `[runtime.context]`:
   - `tool_output_truncate_enabled` (default `false`)

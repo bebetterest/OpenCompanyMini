@@ -1,5 +1,10 @@
 # 进度
 
+## 2026-04-04
+
+- 调整 OpenAI 兼容流式重试策略：即使已经收到部分 SSE 事件，只要遇到可重试的传输/超时或可重试 HTTP 错误，仍会继续重试；每次新尝试都会从干净输出累加器开始，丢弃失败尝试的部分内容。
+- 新增“部分流后断连”回归测试，确保重试可恢复，且最终 `content/raw_events` 仅来自重试成功的那次尝试。
+
 ## 2026-03-31
 
 - 为 `openreward_results.jsonl` 每行新增 `session_id`（稳定任务级 id，与 trace `trace_session_id` 对齐：`<batch_id>:<split>:<task_key>`），并保持旧结果行缺失该字段时的向后兼容读取。

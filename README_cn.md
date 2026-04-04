@@ -381,6 +381,7 @@ class MyDatasetAdapter(DatasetAdapter):
 - 当某个 step 没有可执行工具调用时，运行时会跳过该 step 的协议重试，回填反馈后进入下一步继续自主决策。
 - 当某个 step 的协议重试耗尽时，运行时会将“重试耗尽反馈”写回对话，并进入下一步继续决策，不会自动注入 `finish`。
 - 每个 step 的重试统计会落盘到 `turns.jsonl`（`overall_retries`、API/网络重试、空流重试、解析重试、解析为空重试、上下文超窗重试）。
+- provider 侧流式重试现在也覆盖“已收到部分 SSE 输出后断流”的情况；每次重试都会丢弃失败尝试的部分输出，仅保留成功尝试的输出。
 - 工具集合与上下文压缩阈值。
 - `[runtime.context]` 提供全局工具回填截断控制：
   - `tool_output_truncate_enabled`（默认 `false`）

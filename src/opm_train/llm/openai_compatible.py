@@ -175,7 +175,6 @@ class OpenAICompatibleClient:
                     exc=exc,
                     attempt=attempt,
                     max_attempts=max_attempts,
-                    has_partial_output=received_event,
                 )
                 if retry_reason is None:
                     raise
@@ -186,6 +185,7 @@ class OpenAICompatibleClient:
                         "max_attempts": max_attempts,
                         "wait_seconds": wait_seconds,
                         "reason": retry_reason,
+                        "had_partial_output": received_event,
                         "error_type": type(exc).__name__,
                         "error": str(exc),
                     }
@@ -199,15 +199,12 @@ class OpenAICompatibleClient:
         exc: Exception,
         attempt: int,
         max_attempts: int,
-        has_partial_output: bool,
     ) -> str | None:
         """Classify retryable errors and return reason code when retry is allowed."""
         if attempt + 1 >= max_attempts:
             return None
         if isinstance(exc, EmptyStreamError):
             return "empty_stream"
-        if has_partial_output:
-            return None
         if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
             return "api_or_network"
         if isinstance(exc, httpx.HTTPStatusError):

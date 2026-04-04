@@ -215,3 +215,65 @@ async def test_stream_chat_retries_on_empty_stream() -> None:
     assert EmptyThenSuccessAsyncClient.call_count == 2
     assert len(retries) == 1
     assert retries[0]["reason"] == "empty_stream"
+    assert retries[0]["had_partial_output"] is False
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_retries_on_partial_stream_transport_error_and_discards_partial_output() -> None:
+    class PartialThenErrorResponse(FakeStreamResponse):
+        async def aiter_text(self):
+            yield 'data: {"choices":[{"delta":{"content":"partial-"}}]}\n\n'
+            raise httpx.ReadError("connection dropped", request=self.request)
+
+    class PartialThenSuccessAsyncClient:
+        call_count: int = 0
+
+        def __init__(self, *, timeout: float) -> None:
+            _ = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        def stream(self, method: str, url: str, *, headers: dict[str, str], json: dict[str, object]):
+            _ = (method, url, headers, json)
+            type(self).call_count += 1
+            if type(self).call_count == 1:
+                return PartialThenErrorResponse(chunks=[], status_code=200, error_body="")
+            return FakeStreamResponse(
+                chunks=[
+                    'data: {"choices":[{"delta":{"content":"final"}}]}\n\n',
+                    "data: [DONE]\n\n",
+                ],
+                status_code=200,
+                error_body="",
+            )
+
+    client = OpenAICompatibleClient(
+        base_url="https://example.com/v1",
+        api_key="test-key",
+        timeout_seconds=30,
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._retry_delay = lambda attempt: 0.0  # type: ignore[method-assign]
+    retries: list[dict[str, object]] = []
+
+    with mock.patch("httpx.AsyncClient", PartialThenSuccessAsyncClient):
+        result = await client.stream_chat(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "test"}],
+            temperature=0.1,
+            max_tokens=64,
+            on_retry=lambda payload: retries.append(payload),
+        )
+
+    assert result.content == "final"
+    assert PartialThenSuccessAsyncClient.call_count == 2
+    assert len(retries) == 1
+    assert retries[0]["reason"] == "api_or_network"
+    assert retries[0]["had_partial_output"] is True
+    assert len(result.raw_events) == 1
+    assert result.raw_events[0]["choices"][0]["delta"]["content"] == "final"

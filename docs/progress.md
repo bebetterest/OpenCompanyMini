@@ -1,5 +1,10 @@
 # Progress
 
+## 2026-04-04
+
+- Updated OpenAI-compatible stream retry policy: transport/timeout and retryable HTTP errors now retry even after partial SSE events have been received, and each new attempt starts with a clean output accumulator so failed-attempt partial content is discarded.
+- Added regression coverage for the partial-stream disconnect case to ensure retry succeeds and final content/raw events come only from the successful retry attempt.
+
 ## 2026-03-31
 
 - Added `session_id` to each `openreward_results.jsonl` row (stable per-task id aligned with trace `trace_session_id`: `<batch_id>:<split>:<task_key>`), and kept result-row loading backward-compatible when older rows miss this field.
