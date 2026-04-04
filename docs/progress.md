@@ -4,6 +4,7 @@
 
 - Updated OpenAI-compatible stream retry policy: transport/timeout and retryable HTTP errors now retry even after partial SSE events have been received, and each new attempt starts with a clean output accumulator so failed-attempt partial content is discarded.
 - Added regression coverage for the partial-stream disconnect case to ensure retry succeeds and final content/raw events come only from the successful retry attempt.
+- Updated `wait_run`/`wait_time` timeout handling to return explicit timeout feedback (`timed_out`, `timeout_seconds`, `end_reason`, `error`) and persist timeout tool runs as failed with structured result payload for easier diagnosis.
 
 ## 2026-03-31
 

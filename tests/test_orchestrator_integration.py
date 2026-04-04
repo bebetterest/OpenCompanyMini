@@ -1276,6 +1276,77 @@ async def test_wait_time_returns_steer_interrupt_reason_when_requester_has_pendi
 
 
 @pytest.mark.asyncio
+async def test_wait_run_timeout_returns_feedback_and_marks_tool_run_failed() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        orchestrator.config.runtime.tools.wait_run_timeout_seconds = 0.05
+        requester = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="wait run",
+            workspace_path=project,
+        )
+        target = AgentNode(
+            id="agent-2",
+            session_id="session-1",
+            name="worker",
+            role=AgentRole.WORKER,
+            instruction="still running",
+            workspace_path=project,
+            parent_agent_id=requester.id,
+            status=AgentStatus.RUNNING,
+        )
+        orchestrator.agents = {requester.id: requester, target.id: target}
+        result = await orchestrator._execute_tool_action(
+            agent=requester,
+            action={"type": "wait_run", "agent_id": target.id},
+        )
+        assert result["wait_run_status"] is False
+        assert result["timed_out"] is True
+        assert result["end_reason"] == "timeout"
+        assert "timed out" in str(result.get("error", ""))
+        wait_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "wait_run"]
+        assert len(wait_runs) == 1
+        assert wait_runs[0].status.value == "failed"
+        assert wait_runs[0].error == result["error"]
+        assert isinstance(wait_runs[0].result, dict)
+        assert wait_runs[0].result["timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_wait_time_timeout_returns_feedback_and_marks_tool_run_failed() -> None:
+    with TemporaryDirectory() as temp_dir:
+        project = Path(temp_dir)
+        orchestrator = RuntimeOrchestrator(project_dir=project, app_dir=APP_DIR, llm_client=ResumeLLM())
+        orchestrator.config.runtime.tools.wait_run_timeout_seconds = 0.05
+        agent = AgentNode(
+            id="agent-1",
+            session_id="session-1",
+            name="root",
+            role=AgentRole.ROOT,
+            instruction="wait time",
+            workspace_path=project,
+        )
+        result = await orchestrator._execute_tool_action(
+            agent=agent,
+            action={"type": "wait_time", "seconds": 10},
+        )
+        assert result["wait_time_status"] is False
+        assert result["timed_out"] is True
+        assert result["end_reason"] == "timeout"
+        assert "timed out" in str(result.get("error", ""))
+        wait_runs = [run for run in orchestrator.tool_runs.values() if run.tool_name == "wait_time"]
+        assert len(wait_runs) == 1
+        assert wait_runs[0].status.value == "failed"
+        assert wait_runs[0].error == result["error"]
+        assert isinstance(wait_runs[0].result, dict)
+        assert wait_runs[0].result["timed_out"] is True
+
+
+@pytest.mark.asyncio
 async def test_wait_run_requires_exactly_one_target_and_returns_terminal_status() -> None:
     with TemporaryDirectory() as temp_dir:
         project = Path(temp_dir)

@@ -4,6 +4,7 @@
 
 - 调整 OpenAI 兼容流式重试策略：即使已经收到部分 SSE 事件，只要遇到可重试的传输/超时或可重试 HTTP 错误，仍会继续重试；每次新尝试都会从干净输出累加器开始，丢弃失败尝试的部分内容。
 - 新增“部分流后断连”回归测试，确保重试可恢复，且最终 `content/raw_events` 仅来自重试成功的那次尝试。
+- 调整 `wait_run`/`wait_time` 超时处理：返回明确超时反馈（`timed_out`、`timeout_seconds`、`end_reason`、`error`），并将超时 tool run 以 failed 状态落盘，同时保留结构化结果，便于排障。
 
 ## 2026-03-31
 

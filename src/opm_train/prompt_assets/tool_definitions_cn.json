@@ -39,7 +39,7 @@
     "type": "function",
     "function": {
       "name": "wait_time",
-      "description": "等待一段受限时长。若当前 agent 在等待过程中收到 steer 消息，runtime 可能提前返回并带上 interrupted_by_steer=true。",
+      "description": "等待一段受限时长。若当前 agent 在等待过程中收到 steer 消息，runtime 可能提前返回并带上 interrupted_by_steer=true。若先触发 runtime 超时，返回会包含 timed_out=true、end_reason='timeout' 与 error。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -334,7 +334,7 @@
     "type": "function",
     "function": {
       "name": "wait_run",
-      "description": "阻塞等待指定 tool run 或 agent run 进入要求的终态。若当前 agent 在等待过程中收到 steer 消息，runtime 可能提前返回并带上 interrupted_by_steer=true。",
+      "description": "阻塞等待指定 tool run 或 agent run 进入要求的终态。若当前 agent 在等待过程中收到 steer 消息，runtime 可能提前返回并带上 interrupted_by_steer=true。若先触发 runtime 超时，返回会包含 timed_out=true、end_reason='timeout' 与 error。",
       "parameters": {
         "type": "object",
         "description": "必须且只能提供 tool_run_id 或 agent_id 其中之一，运行时会校验该约束。",

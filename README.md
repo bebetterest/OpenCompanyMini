@@ -94,7 +94,7 @@ Common options:
 - `resume` marks non-restorable non-terminal tool runs as `abandoned` instead of `failed`.
 - `doctor` now reports tool-contract checks via `tool_contract_ok` and `tool_contract_issues`; `ready_for_real_run` requires tool contract consistency.
 - Tool/action execution errors (for example unknown `agent_id`, missing tool `type`, or disabled tool name) no longer terminate the agent loop by bubbling exceptions; runtime records the error, marks the tool run failed, and returns a structured error payload (`error.code` / `error.type` / `error.message`).
-- `shell` and `wait_run` now read default timeout settings from `runtime.tools.shell_timeout_seconds` and `runtime.tools.wait_run_timeout_seconds` (action-level `timeout_seconds` still overrides); timeout responses now include timeout context (`timed_out`, `timeout_seconds`).
+- `shell` now reads default timeout from `runtime.tools.shell_timeout_seconds` (action-level `timeout_seconds` can still override), while `wait_run`/`wait_time` use `runtime.tools.wait_run_timeout_seconds` as timeout budget; wait-tool timeout responses now return explicit timeout feedback (`timed_out`, `timeout_seconds`, `end_reason="timeout"`, `error`).
 
 ## Runtime Data
 

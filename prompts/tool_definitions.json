@@ -39,7 +39,7 @@
     "type": "function",
     "function": {
       "name": "wait_time",
-      "description": "Wait for a bounded number of seconds. If this agent receives a steer message while waiting, runtime may return early with interrupted_by_steer=true.",
+      "description": "Wait for a bounded number of seconds. If this agent receives a steer message while waiting, runtime may return early with interrupted_by_steer=true. If runtime timeout is hit first, response includes timed_out=true, end_reason='timeout', and error.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -334,7 +334,7 @@
     "type": "function",
     "function": {
       "name": "wait_run",
-      "description": "Block until a tool run or agent run reaches the required terminal state. If this agent receives a steer message while waiting, runtime may return early with interrupted_by_steer=true.",
+      "description": "Block until a tool run or agent run reaches the required terminal state. If this agent receives a steer message while waiting, runtime may return early with interrupted_by_steer=true. If runtime timeout is hit first, response includes timed_out=true, end_reason='timeout', and error.",
       "parameters": {
         "type": "object",
         "description": "Provide exactly one of tool_run_id or agent_id. Runtime validates this contract.",

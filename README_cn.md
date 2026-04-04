@@ -94,7 +94,7 @@ opm-train export --session-id <session_id> [--agent-id <agent_id>] [--step <n>] 
 - `resume` 对不可恢复的未终态 tool run 记为 `abandoned`，不再记为 `failed`。
 - `doctor` 新增工具契约检查输出 `tool_contract_ok` 与 `tool_contract_issues`；`ready_for_real_run` 需要工具契约一致。
 - 工具/动作执行错误（如未知 `agent_id`、缺失工具 `type`、或工具名未启用）不再通过抛异常直接终止 agent loop；运行时会记录错误、将 tool run 标记为 failed，并返回结构化错误负载（`error.code` / `error.type` / `error.message`）。
-- `shell` 与 `wait_run` 的默认超时现由 `runtime.tools.shell_timeout_seconds` 与 `runtime.tools.wait_run_timeout_seconds` 统一配置（动作内 `timeout_seconds` 仍可覆盖）；超时返回会包含超时上下文（`timed_out`、`timeout_seconds`）。
+- `shell` 的默认超时由 `runtime.tools.shell_timeout_seconds` 提供（动作内 `timeout_seconds` 仍可覆盖），`wait_run`/`wait_time` 则使用 `runtime.tools.wait_run_timeout_seconds` 作为等待预算；等待类工具超时时会返回明确反馈（`timed_out`、`timeout_seconds`、`end_reason="timeout"`、`error`）。
 
 ## 运行数据
 

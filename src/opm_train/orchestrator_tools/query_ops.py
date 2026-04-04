@@ -314,11 +314,22 @@ class QueryToolMixin:
                 await asyncio.sleep(_WAIT_AGENT_POLL_SECONDS)
 
             if timeout_seconds > 0 and (loop.time() - started) >= timeout_seconds:
-                return {
+                timeout_error = f"wait_run timed out after {timeout_seconds:g}s"
+                payload = {
                     "wait_run_status": False,
                     "timed_out": True,
                     "timeout_seconds": timeout_seconds,
+                    "end_reason": "timeout",
+                    "error": timeout_error,
                 }
+                if wait_request_run.status == ToolRunStatus.RUNNING:
+                    self._set_tool_run_terminal(
+                        wait_request_run,
+                        status=ToolRunStatus.FAILED,
+                        result=payload,
+                        error=timeout_error,
+                    )
+                return payload
 
     async def _tool_cancel_tool_run(self, action: dict[str, Any]) -> dict[str, Any]:
         """Cancel a running tool and return final status."""
@@ -378,11 +389,22 @@ class QueryToolMixin:
             if now >= wait_deadline:
                 return {"wait_time_status": True}
             if timeout_seconds > 0 and (now - started) >= timeout_seconds:
-                return {
+                timeout_error = f"wait_time timed out after {timeout_seconds:g}s"
+                payload = {
                     "wait_time_status": False,
                     "timed_out": True,
                     "timeout_seconds": timeout_seconds,
+                    "end_reason": "timeout",
+                    "error": timeout_error,
                 }
+                if wait_request_run.status == ToolRunStatus.RUNNING:
+                    self._set_tool_run_terminal(
+                        wait_request_run,
+                        status=ToolRunStatus.FAILED,
+                        result=payload,
+                        error=timeout_error,
+                    )
+                return payload
             remaining_wait = max(0.0, wait_deadline - now)
             sleep_for = min(_WAIT_TIME_POLL_SECONDS, remaining_wait)
             if timeout_seconds > 0:
